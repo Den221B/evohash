@@ -3,7 +3,7 @@ from .base import HashSpec, HashFunction, HashRegistry
 from .phash import PHashWrapper
 from .pdq import PDQWrapper
 from .neuralhash import NeuralHashWrapper
-from .photodna import PhotoDNAWrapper
+from .photodna import PhotoDNAWrapper, setup_photodna
 
 __all__ = [
     "HashSpec",
@@ -13,6 +13,7 @@ __all__ = [
     "PDQWrapper",
     "NeuralHashWrapper",
     "PhotoDNAWrapper",
+    "setup_photodna",
     "build_default_registry",
 ]
 
@@ -23,23 +24,23 @@ def build_default_registry(
     pdq: bool = True,
     neuralhash: bool = False,
     photodna: bool = False,
-    neuralhash_model_dir: str = "",   # "" → uses NeuralHashWrapper default cache
-    photodna_work_dir: str = "",      # "" → uses PhotoDNAWrapper default cache
+    neuralhash_model_dir: str = "",  # "" → evohash/hashes/model/ (bundled)
+    photodna_work_dir: str = "",     # "" → ~/.cache/photodna
 ) -> HashRegistry:
     """Build a HashRegistry with the requested hash functions.
 
-    pHash and PDQ are enabled by default (require imagehash / pdqhash).
-    NeuralHash and PhotoDNA require additional one-time setup — see their
-    respective setup functions before enabling.
+    pHash and PDQ are enabled by default.
+    NeuralHash requires model files in evohash/hashes/model/.
+    PhotoDNA requires setup_photodna() to have been called first.
 
     Parameters
     ----------
     neuralhash_model_dir : str
-        Override cache directory for NeuralHash ONNX/dat files.
-        Leave empty to use the default (~/.cache/neuralhash).
+        Override directory for model.onnx / model.dat.
+        Leave empty to use bundled evohash/hashes/model/.
     photodna_work_dir : str
-        Override work directory for PhotoDNA DLL and Wine Python.
-        Leave empty to use the default (~/.cache/photodna).
+        Override work dir for PhotoDNA (DLL + Wine Python).
+        Leave empty to use ~/.cache/photodna.
     """
     reg = HashRegistry()
     if phash:

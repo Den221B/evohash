@@ -6,8 +6,8 @@ Everything is handled inside this file:
   - Minimal Wine Python 3.9 download
   - Hash computation via subprocess call to Wine Python
 
-Digest  : np.ndarray uint16, shape (144,)
-Distance: L1 norm
+Digest   : np.ndarray uint8, shape (144,)
+Distance : L1 norm
 Threshold: 3855
 
 Performance note:
@@ -17,7 +17,7 @@ Performance note:
 
 Usage (in notebook):
     from evohash.hashes.photodna import PhotoDNAWrapper, setup_photodna
-    setup_photodna()                 # one-time, ~5 min
+    setup_photodna()                 # one-time, ~5-10 min
     register_or_replace_hash(hashes, PhotoDNAWrapper())
 """
 from __future__ import annotations
@@ -26,7 +26,7 @@ import os
 import shutil
 import subprocess
 import tempfile
-from typing import Any, List, Tuple
+from typing import Any, List
 
 import numpy as np
 from PIL import Image
@@ -37,51 +37,41 @@ from .base import HashSpec, HashFunction
 # Paths
 # ---------------------------------------------------------------------------
 
-_DEFAULT_WORK_DIR = os.environ.get(
-    "PHOTODNA_WORK_DIR",
-    os.path.join(os.path.expanduser("~"), ".cache", "photodna"),
+_DEFAULT_WORK_DIR = (
+    os.environ.get("PHOTODNA_WORK_DIR")
+    or os.path.join(os.path.expanduser("~"), ".cache", "photodna")
 )
 
-_WINE_PYTHON_SUBPATH = "wine_python_39/python-3.9.12-embed-amd64/python.exe"
+_WINE_PYTHON_SUBPATH = "python-3.9.12-embed-amd64/python.exe"
 
 # ---------------------------------------------------------------------------
-# generateHashes.py — zipped into this file, written to disk on first setup
+# generateHashes.py — embedded as string, written to disk on first setup
 # ---------------------------------------------------------------------------
 
 _GENERATE_HASHES_SRC = r'''"""
 PhotoDNA hash generator for Wine Python.
 Usage (single):  python generateHashes.py <image_path>
 Usage (batch):   python generateHashes.py <img1> <img2> ...
-Output: one line per image — comma-separated uint16 values (144 numbers).
+Output: one line per image — comma-separated uint8 values (144 numbers).
 """
-import sys, os, ctypes, struct
-from PIL import Image
+import sys, os, ctypes
+from ctypes import c_char_p, c_int, c_ubyte, POINTER
+from PIL import Image, ImageFile
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 DLL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "PhotoDNAx64.dll")
 
-_lib = ctypes.CDLL(DLL_PATH)
-_lib.PhotoDNAHashImage.restype  = ctypes.c_int
-_lib.PhotoDNAHashImage.argtypes = [
-    ctypes.c_char_p,  # image data (RGB24, row-major)
-    ctypes.c_int,     # width
-    ctypes.c_int,     # height
-    ctypes.c_int,     # stride = width * 3
-    ctypes.c_char_p,  # output buffer (288 bytes = 144 x uint16 LE)
-]
-
-HASH_BYTES = 288  # 144 * sizeof(uint16)
+_lib = ctypes.cdll.LoadLibrary(DLL_PATH)
+_fn = _lib.ComputeRobustHash
+_fn.argtypes = [c_char_p, c_int, c_int, c_int, POINTER(c_ubyte), c_int]
+_fn.restype  = c_ubyte
 
 
 def compute(image_path: str) -> str:
     img = Image.open(image_path).convert("RGB")
-    w, h = img.size
-    raw = img.tobytes()
-    buf = ctypes.create_string_buffer(HASH_BYTES)
-    ret = _lib.PhotoDNAHashImage(raw, w, h, w * 3, buf)
-    if ret != 0:
-        raise RuntimeError(f"PhotoDNAHashImage returned {ret} for {image_path}")
-    values = struct.unpack_from(f"<{HASH_BYTES // 2}H", buf.raw)
-    return ",".join(str(v) for v in values)
+    buf = (c_ubyte * 144)()
+    _fn(c_char_p(img.tobytes()), img.width, img.height, 0, buf, 0)
+    return ",".join(str(v) for v in buf)
 
 
 if __name__ == "__main__":
@@ -240,7 +230,7 @@ def _parse_hash_line(line: str) -> np.ndarray:
     values = [int(v.strip()) for v in line.strip().split(",") if v.strip()]
     if len(values) != 144:
         raise RuntimeError(f"Expected 144 hash values, got {len(values)}: {line[:120]}")
-    return np.array(values, dtype=np.uint16)
+    return np.array(values, dtype=np.uint8)
 
 
 def _wine_run(wine_python: str, script: str, args: List[str], timeout: int = 120) -> str:
@@ -267,8 +257,8 @@ def _wine_run(wine_python: str, script: str, args: List[str], timeout: int = 120
 class PhotoDNAWrapper:
     """Microsoft PhotoDNA perceptual hash.
 
-    Call ``setup_photodna()`` once before use (or on import via the notebook
-    section).  After that, paths are resolved lazily on first compute() call.
+    Call ``setup_photodna()`` once before use.
+    Paths are resolved lazily on first compute() call.
 
     Parameters
     ----------
@@ -313,7 +303,7 @@ class PhotoDNAWrapper:
     def compute(self, image: np.ndarray) -> np.ndarray:
         """Compute PhotoDNA hash for a single image.
 
-        Note: spawns a wine64 process each call.  For many images prefer
+        Note: spawns a wine64 process each call. For many images prefer
         compute_batch() to amortise Wine startup cost.
         """
         self._resolve()

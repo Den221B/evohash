@@ -1,72 +1,61 @@
 """NeuralHash — Apple's perceptual hash via ONNX.
 
-Model files are fetched automatically from HuggingFace the first time.
-No macOS required.
+Model files must be placed in evohash/hashes/model/ (committed to repo):
+    neuralhash_128x96_seed1.onnx
+    neuralhash_128x96_seed1.dat
 
 Source: https://github.com/AsuharietYgvar/AppleNeuralHash2ONNX
 
 Pipeline (all steps run locally):
     1. Convert image to RGB
-    2. Resize to 360×360
-    3. Normalise pixel values to [-1, 1]
+    2. Resize to 360x360
+    3. Normalise pixel values to [-1, 1]  (arr * 2.0 - 1.0)
     4. ONNX model inference → 128-dim embedding
-    5. Dot product with seed matrix (128×96) → 96 floats
-    6. Binarise via sign → {0, 1}^96
+    5. Dot product: seed (96x128) @ embedding (128,) → 96 floats
+    6. Binarise via sign → {0,1}^96
     7. Hamming distance on binarised bits
 
-Digest    : np.ndarray float32, shape (96,)  — step-5 output (pre-binarisation)
+Digest    : np.ndarray uint8, shape (96,)  — binarised bits {0, 1}
 Distance  : Hamming on binarised bits
 Threshold : 17
 """
 from __future__ import annotations
 
 import os
-import urllib.request
-from typing import Any
-
 import numpy as np
 from PIL import Image
 
 from .base import HashSpec, HashFunction
 
 # ---------------------------------------------------------------------------
-# HuggingFace mirror — model files extracted from iOS 14.8 IPSW,
-# published in the public domain by the research community.
+# Model file resolution
+# Priority:
+#   1. NEURALHASH_MODEL_DIR env var  (override for custom location)
+#   2. evohash/hashes/model/         (bundled in repo — default)
 # ---------------------------------------------------------------------------
-_HF_BASE = "https://huggingface.co/QualiaSystems/neural-hash-onnx/resolve/main"
-_FILES = {
-    "neuralhash_128x96_seed1.onnx": f"{_HF_BASE}/neuralhash_128x96_seed1.onnx",
-    "neuralhash_128x96_seed1.dat":  f"{_HF_BASE}/neuralhash_128x96_seed1.dat",
-}
 
-_DEFAULT_CACHE_DIR = os.environ.get(
-    "NEURALHASH_MODEL_DIR",
-    os.path.join(os.path.expanduser("~"), ".cache", "neuralhash"),
+_BUNDLED_MODEL_DIR = os.path.join(os.path.dirname(__file__), "model")
+
+_MODEL_DIR = (
+    os.environ.get("NEURALHASH_MODEL_DIR") or _BUNDLED_MODEL_DIR
 )
 
+_ONNX_FILENAME = "model.onnx"
+_SEED_FILENAME  = "model.dat"
 
-# ---------------------------------------------------------------------------
-# Download helper
-# ---------------------------------------------------------------------------
 
-def _download_models(cache_dir: str) -> None:
-    """Download model files to cache_dir if not already present."""
-    os.makedirs(cache_dir, exist_ok=True)
-    for filename, url in _FILES.items():
-        dest = os.path.join(cache_dir, filename)
-        if os.path.isfile(dest):
-            continue
-        print(f"[NeuralHash] Downloading {filename} ...", flush=True)
-        try:
-            urllib.request.urlretrieve(url, dest)
-            print(f"[NeuralHash] Saved -> {dest}")
-        except Exception as exc:
-            if os.path.isfile(dest):
-                os.remove(dest)
-            raise RuntimeError(
-                f"Failed to download {filename} from {url}\n"
-                "Set NEURALHASH_MODEL_DIR to a directory with manually placed files."
-            ) from exc
+def _check_model_files(model_dir: str) -> None:
+    """Raise a clear error if model files are missing."""
+    for fname in (_ONNX_FILENAME, _SEED_FILENAME):
+        path = os.path.join(model_dir, fname)
+        if not os.path.isfile(path):
+            raise FileNotFoundError(
+                f"[NeuralHash] Model file not found: {path}\n"
+                f"Place both files in: {model_dir}\n"
+                f"  {_ONNX_FILENAME}\n"
+                f"  {_SEED_FILENAME}\n"
+                "Then commit to repo:  git add hashes/model/ && git push"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -74,11 +63,14 @@ def _download_models(cache_dir: str) -> None:
 # ---------------------------------------------------------------------------
 
 def _preprocess(image: np.ndarray) -> np.ndarray:
-    """Steps 1-3: RGB -> resize 360x360 -> normalise to [-1, 1].
+    """Steps 1-3: ensure uint8 RGB → resize 360x360 → normalise to [-1, 1].
+
+    Matches exactly the reference nnhash.py implementation:
+        arr = np.array(image).astype(np.float32) / 255.0
+        arr = arr * 2.0 - 1.0
 
     Returns float32 array of shape (1, 3, 360, 360).
     """
-    # Step 1: ensure uint8 RGB
     if image.dtype != np.uint8:
         image = np.clip(image.astype(np.float32) * 255.0, 0, 255).astype(np.uint8)
     if image.ndim == 2:
@@ -86,34 +78,25 @@ def _preprocess(image: np.ndarray) -> np.ndarray:
     elif image.ndim == 3 and image.shape[-1] == 4:
         image = image[..., :3]
 
-    # Step 2: resize to 360x360
-    pil = Image.fromarray(image).convert("RGB").resize((360, 360), Image.BILINEAR)
-
-    # Step 3: normalise to [-1, 1]
-    arr = (np.array(pil).astype(np.float32) / 127.5) - 1.0
-
-    # NCHW layout expected by the model
-    return arr.transpose(2, 0, 1)[np.newaxis]  # (1, 3, 360, 360)
+    pil = Image.fromarray(image).convert("RGB").resize((360, 360))
+    arr = np.array(pil).astype(np.float32) / 255.0
+    arr = arr * 2.0 - 1.0                          # → [-1, 1]
+    return arr.transpose(2, 0, 1)[np.newaxis]       # → (1, 3, 360, 360)
 
 
 # ---------------------------------------------------------------------------
-# GPU / provider selection
+# GPU provider selection
 # ---------------------------------------------------------------------------
 
-def _get_providers(ort_module) -> list:
-    """Return provider list: CUDA first if available, CPU as fallback.
-
-    ONNX Runtime silently falls back to CPU if CUDA initialisation fails,
-    so listing both is always safe.
-    """
-    available = ort_module.get_available_providers()
+def _get_providers(ort) -> list:
+    available = ort.get_available_providers()
     if "CUDAExecutionProvider" in available:
-        print("[NeuralHash] CUDAExecutionProvider detected -- GPU will be used")
+        print("[NeuralHash] Using GPU (CUDAExecutionProvider)")
         return [
             ("CUDAExecutionProvider", {"cudnn_conv_algo_search": "DEFAULT"}),
             "CPUExecutionProvider",
         ]
-    print("[NeuralHash] CUDAExecutionProvider not available -- using CPU")
+    print("[NeuralHash] Using CPU")
     return ["CPUExecutionProvider"]
 
 
@@ -124,22 +107,24 @@ def _get_providers(ort_module) -> list:
 class NeuralHashWrapper:
     """Apple NeuralHash perceptual hash.
 
-    Call warmup() once after construction (or it will happen automatically
-    on the first compute() call).  After warmup the session stays loaded
-    in memory for the lifetime of the object -- compute() is just inference.
+    Model files must be committed to evohash/hashes/model/ before use.
+    Loaded eagerly on construction by default (eager_load=True).
 
     Parameters
     ----------
     threshold_p : float
-        Maximum Hamming distance to consider two images similar (default 17).
+        Maximum Hamming distance for similarity (default 17).
     model_dir : str
-        Directory for ONNX / dat files.  Downloaded automatically if absent.
+        Directory containing ONNX and dat files.
+        Defaults to evohash/hashes/model/ (bundled in repo).
+    eager_load : bool
+        Load model immediately on construction (default True).
     """
 
     def __init__(
         self,
         threshold_p: float = 17.0,
-        model_dir: str = _DEFAULT_CACHE_DIR,
+        model_dir: str = _MODEL_DIR,
         eager_load: bool = True,
     ) -> None:
         self.spec = HashSpec(
@@ -147,10 +132,10 @@ class NeuralHashWrapper:
             threshold_p=float(threshold_p),
             distance_name="hamming",
         )
-        self._model_dir = model_dir
-        self._session = None   # loaded once in warmup()
-        self._seed: np.ndarray | None = None
-        self._input_name: str | None = None
+        self._model_dir   = model_dir
+        self._session     = None
+        self._seed        = None   # np.ndarray (96, 128)
+        self._input_name  = None
 
         if eager_load:
             self.warmup()
@@ -160,7 +145,7 @@ class NeuralHashWrapper:
     # ------------------------------------------------------------------
 
     def warmup(self) -> "NeuralHashWrapper":
-        """Load model into memory (idempotent).
+        """Load ONNX session and seed matrix (idempotent).
 
         Returns self for chaining:
             register_or_replace_hash(hashes, NeuralHashWrapper().warmup())
@@ -168,34 +153,28 @@ class NeuralHashWrapper:
         if self._session is not None:
             return self
 
-        _download_models(self._model_dir)
-
-        model_path = os.path.join(self._model_dir, "neuralhash_128x96_seed1.onnx")
-        seed_path  = os.path.join(self._model_dir, "neuralhash_128x96_seed1.dat")
+        _check_model_files(self._model_dir)
 
         try:
             import onnxruntime as ort
         except ImportError as exc:
             raise RuntimeError(
                 "onnxruntime not installed.\n"
-                "CPU:  pip install onnxruntime\n"
-                "GPU:  pip install onnxruntime-gpu"
+                "GPU:  pip install onnxruntime-gpu\n"
+                "CPU:  pip install onnxruntime"
             ) from exc
 
-        providers = _get_providers(ort)
-        self._session = ort.InferenceSession(model_path, providers=providers)
-        active = self._session.get_providers()
-        print(f"[NeuralHash] Session providers: {active}")
+        model_path = os.path.join(self._model_dir, _ONNX_FILENAME)
+        seed_path  = os.path.join(self._model_dir, _SEED_FILENAME)
 
-        # Cache input name (usually 'image' but may differ by ONNX export)
+        self._session    = ort.InferenceSession(model_path, providers=_get_providers(ort))
         self._input_name = self._session.get_inputs()[0].name
 
-        # Seed matrix: (128, 96) float32 — used in step 5
-        self._seed = (
-            np.frombuffer(open(seed_path, "rb").read(), dtype=np.float32)
-            .reshape((128, 96))
-        )
-        print("[NeuralHash] Model loaded")
+        # Matches reference: read()[128:], reshape([96, 128])
+        raw = open(seed_path, "rb").read()[128:]
+        self._seed = np.frombuffer(raw, dtype=np.float32).reshape([96, 128])
+
+        print(f"[NeuralHash] Loaded — providers: {self._session.get_providers()}")
         return self
 
     # ------------------------------------------------------------------
@@ -203,24 +182,25 @@ class NeuralHashWrapper:
     # ------------------------------------------------------------------
 
     def compute(self, image: np.ndarray) -> np.ndarray:
-        """Return 96-dim float32 embedding (pre-binarisation, step-5 output).
+        """Return binarised 96-bit hash as uint8 array of 0/1 values.
 
-        Steps performed here:
-            1-3  _preprocess()     -- RGB / resize 360x360 / normalise [-1,1]
-            4    ONNX inference    -- model -> 128-dim embedding
-            5    seed dot product  -- embedding @ seed -> 96 floats
+        Steps performed:
+            1-3  _preprocess()  — RGB / resize / normalise [-1,1]
+            4    ONNX inference — → 128-dim embedding
+            5    seed.dot()     — (96,128) @ (128,) → (96,) floats
+            6    binarise       — value >= 0 → 1, else → 0
         """
         if self._session is None:
             self.warmup()
 
-        arr = _preprocess(image)                          # (1, 3, 360, 360)
-        outputs = self._session.run(None, {self._input_name: arr})
-        embedding = outputs[0].flatten()                  # (128,)
-        hash_bits = self._seed.T @ embedding              # (96,)
-        return hash_bits.astype(np.float32)
+        arr       = _preprocess(image)
+        out       = self._session.run(None, {self._input_name: arr})
+        embedding = out[0].flatten()                               # (128,)
+        floats    = self._seed.dot(embedding)                      # (96,)
+        return (floats >= 0).astype(np.uint8)                      # (96,) bits
 
     def distance(self, d1: np.ndarray, d2: np.ndarray) -> float:
-        """Steps 6-7: binarise via sign, count differing bits (Hamming)."""
-        b1 = (np.sign(d1) > 0).astype(np.int8)
-        b2 = (np.sign(d2) > 0).astype(np.int8)
-        return float(np.count_nonzero(b1 != b2))
+        """Hamming distance on binarised 96-bit hashes."""
+        return float(np.count_nonzero(
+            d1.astype(np.uint8) != d2.astype(np.uint8)
+        ))
