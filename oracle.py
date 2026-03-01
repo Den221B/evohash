@@ -1,10 +1,16 @@
 """Oracle: the only interface attacks can use to query a hash function.
 
 Attacks receive a HashOracle instance and call:
-  oracle.score(x)       → float  (hash distance to target; lower = better)
+  oracle.query(x)       → float  (hash distance to target; lower = better)
+  oracle.score(x)       → float  (alias for query)
   oracle.is_success(x)  → bool   (distance ≤ threshold)
   oracle.project(x)     → ndarray (clip + optional L2-ball projection)
   oracle.budget_ok()    → bool   (queries / time budget not exhausted)
+
+Properties:
+  oracle.threshold      → float  (alias for threshold_p)
+  oracle.threshold_p    → float  (hash distance threshold)
+  oracle.queries_used   → int    (total queries so far)
 """
 from __future__ import annotations
 
@@ -60,7 +66,7 @@ class OracleState:
 class HashOracle:
     """Black-box query interface for a single hash function + target digest.
 
-    The attack receives x0 (source image) and queries oracle.score(x_candidate).
+    The attack receives x0 (source image) and queries oracle.query(x_candidate).
     It never sees the target image y directly — only hash(y) is stored here.
     """
 
@@ -99,6 +105,16 @@ class HashOracle:
     def threshold_p(self) -> float:
         return self.hash_fn.spec.threshold_p
 
+    @property
+    def threshold(self) -> float:
+        """Alias for threshold_p — used by attack implementations."""
+        return self.hash_fn.spec.threshold_p
+
+    @property
+    def queries_used(self) -> int:
+        """Total number of queries made so far."""
+        return self.state.queries_used
+
     def budget_ok(self) -> bool:
         """Return True if there are still queries and time remaining."""
         if self.state.queries_used >= self.budget.max_queries:
@@ -110,8 +126,12 @@ class HashOracle:
             return False
         return True
 
-    def score(self, x: np.ndarray) -> float:
-        """Query hash distance of x to the target. Counts as one query."""
+    def query(self, x: np.ndarray) -> float:
+        """Query hash distance of x to the target. Counts as one query.
+
+        Primary interface used by all attack implementations.
+        Returns best_score if budget is exhausted (does not raise).
+        """
         if not self.budget_ok():
             return float(self.state.best_score)
 
@@ -125,9 +145,13 @@ class HashOracle:
 
         return s
 
+    def score(self, x: np.ndarray) -> float:
+        """Alias for query() — kept for backward compatibility."""
+        return self.query(x)
+
     def is_success(self, x: np.ndarray) -> bool:
         """Return True if x produces a hash collision with the target."""
-        return self.score(x) <= self.threshold_p
+        return self.query(x) <= self.threshold_p
 
     def project(self, x: np.ndarray) -> np.ndarray:
         """Clip x to valid pixel range [clip_lo, clip_hi]."""

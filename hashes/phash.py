@@ -35,13 +35,19 @@ class PHashWrapper:
             distance_name="hamming",
         )
 
-    def compute(self, image: np.ndarray) -> Any:
+    def compute(self, image: np.ndarray) -> np.ndarray:
         img = _to_uint8(image)
         pil = Image.fromarray(img).convert("RGB")
-        return self._ih.phash(pil)
+        ih = self._ih.phash(pil)
+        # конвертировать в uint8 биты (64,) — единый формат
+        int_val = int(str(ih), 16)
+        bits = np.array([(int_val >> (63 - i)) & 1 for i in range(64)], dtype=np.uint8)
+        return bits
 
-    def distance(self, d1: Any, d2: Any) -> float:
-        return float(d1 - d2)
+    def distance(self, d1: np.ndarray, d2: np.ndarray) -> float:
+        return float(np.count_nonzero(
+            np.asarray(d1, dtype=np.uint8) != np.asarray(d2, dtype=np.uint8)
+        ))
 
 
 # ---------------------------------------------------------------------------
