@@ -1,16 +1,19 @@
 """Hybrid two-stage attacks: score-based phase + HSJA decision-based refinement.
 
-Stage 1 (score-based): Run NES/SimBa/ZO-Sign-SGD using continuous hash
-    distance signal.  Stop early once within `switch_threshold` of the
-    collision threshold (or after `stage1_queries` queries).
+Stage 1 (score-based): NES / SimBa / ZO — continuous hash distance.
+    Использует первые stage1_time_fraction времени.
+    Останавливается при успехе или по времени.
 
-Stage 2 (HSJA): Starting from the best point found in stage 1, refine
-    using binary decision feedback only.  This boundary-walking phase
-    minimises L2 distortion while maintaining the collision.
+Stage 2 (HSJA): decision-based refinement.
+    Стартует из x_mid (лучшая точка stage 1).
+    y_init передаётся в HSJA для гарантированного начала если stage 1 не нашёл коллизию.
 
-Hybrids evaluated in:
-    Madden et al., "Assessing the adversarial security of perceptual
-    hashing algorithms", arXiv 2406.00918, 2024.
+Key fixes vs original:
+  - stage split теперь time-based (_BudgetProxy по времени), не query-based.
+    Оригинал делил max_queries, что бессмысленно при time-only бюджете.
+  - y_init передаётся в HSJA — без него HSJA почти всегда fails на random парах.
+  - L2: RMS sqrt(mean(...)), согласованно с utils.l2_img.
+  - Убран _l2 с sqrt(sum(...)), везде используется RMS.
 """
 from __future__ import annotations
 
@@ -29,52 +32,58 @@ from .hsja import HSJAAttack
 
 
 def _l2(a: np.ndarray, b: np.ndarray) -> float:
-    return float(np.sqrt(np.sum((a.astype(np.float64) - b.astype(np.float64)) ** 2)))
+    """RMS L2 — согласованно с utils.l2_img."""
+    return float(np.sqrt(np.mean((a.astype(np.float64) - b.astype(np.float64)) ** 2)))
 
 
-def _wrap_hybrid(stage1_id: str, stage1_instance, stage2_instance: HSJAAttack):
-    """Factory that produces a Hybrid attack dataclass combining two stages."""
+# ---------------------------------------------------------------------------
+# Hybrid factory
+# ---------------------------------------------------------------------------
+
+def _make_hybrid(stage1_id: str, stage1_attack, stage2_attack: HSJAAttack):
 
     @dataclass
     class _HybridAttack:
-        stage1: type = field(default_factory=lambda: stage1_instance)
-        stage2: HSJAAttack = field(default_factory=lambda: stage2_instance)
-        stage1_query_fraction: float = 0.5   # fraction of budget for stage 1
+        stage1: object = field(default_factory=lambda: stage1_attack)
+        stage2: HSJAAttack = field(default_factory=lambda: stage2_attack)
+        stage1_time_fraction: float = 0.5
+        y_init: Optional[np.ndarray] = None   # устанавливается из evaluator
         spec: AttackSpec = field(init=False)
 
         def __post_init__(self) -> None:
             self.spec = AttackSpec(
                 attack_id=f"{stage1_id}+hsja",
-                params=dict(
-                    stage1=stage1_id,
-                    stage1_query_fraction=self.stage1_query_fraction,
-                ),
+                params=dict(stage1=stage1_id, stage1_time_fraction=self.stage1_time_fraction),
             )
 
-        def run(
-            self,
-            x0: np.ndarray,
-            oracle: HashOracle,
-            budget: BudgetSpec,
-        ) -> AttackResult:
+        def run(self, x0: np.ndarray, oracle: HashOracle, budget: BudgetSpec) -> AttackResult:
             t0 = time.monotonic()
             history: List[float] = []
-            threshold = getattr(oracle, "threshold", 0.0)
+            thr = oracle.threshold
 
-            # --- Stage 1 ---
-            max_q = getattr(budget, "max_queries", int(1e9))
-            stage1_q = int(max_q * self.stage1_query_fraction)
-
-            # temporarily monkey-patch budget for stage 1
-            stage1_budget = _BudgetProxy(budget, stage1_q)
-            r1 = self.stage1.run(x0, oracle, stage1_budget)
+            # Stage 1: ограничиваем время через временную подмену oracle.budget.
+            # oracle.budget_ok() сравнивает elapsed с budget.max_time_s.
+            # started_at — время создания oracle. Если подставим stage1_time,
+            # stage 1 остановится когда oracle проживёт stage1_time секунд.
+            total_time = budget.max_time_s
+            if total_time is not None:
+                stage1_budget = BudgetSpec(
+                    max_time_s=total_time * self.stage1_time_fraction,
+                    max_queries=budget.max_queries,
+                    seed=budget.seed,
+                )
+                orig_budget = oracle.budget
+                oracle.budget = stage1_budget
+                r1 = self.stage1.run(x0, oracle, stage1_budget)
+                oracle.budget = orig_budget  # восстанавливаем для stage 2
+            else:
+                r1 = self.stage1.run(x0, oracle, budget)
             history.extend(r1.history)
 
             x_mid = r1.x_best
             best_score = r1.best_score
 
-            if best_score <= threshold:
-                # stage 1 already succeeded
+            if best_score <= thr:
                 elapsed = int((time.monotonic() - t0) * 1000)
                 return AttackResult(
                     x_best=x_mid,
@@ -86,14 +95,17 @@ def _wrap_hybrid(stage1_id: str, stage1_instance, stage2_instance: HSJAAttack):
                     extra={"l2": _l2(x0, x_mid), "stage": 1},
                 )
 
-            # --- Stage 2: HSJA starting from x_mid ---
-            r2 = self.stage2.run(x_mid, oracle, budget)
+            # Stage 2: HSJA стартует от оригинального x0.
+            # Stage 1 не нашёл коллизию (иначе вернули бы выше),
+            # поэтому берём y_init как гарантированную начальную коллизию.
+            self.stage2.y_init = self.y_init
+            r2 = self.stage2.run(x0, oracle, budget)  # x0 — оригинальный source
             history.extend(r2.history)
 
             best_x = r2.x_best if r2.best_score < best_score else x_mid
             best_score = min(r2.best_score, best_score)
 
-            reason = "success" if best_score <= threshold else "budget"
+            reason = "success" if best_score <= thr else "budget"
             elapsed = int((time.monotonic() - t0) * 1000)
             return AttackResult(
                 x_best=best_x,
@@ -108,54 +120,44 @@ def _wrap_hybrid(stage1_id: str, stage1_instance, stage2_instance: HSJAAttack):
     return _HybridAttack()
 
 
-class _BudgetProxy:
-    """Thin wrapper that forwards attribute access but caps max_queries."""
-    def __init__(self, budget, cap: int):
-        self._budget = budget
-        self.max_queries = cap
-
-    def __getattr__(self, name):
-        return getattr(self._budget, name)
-
-
 # ---------------------------------------------------------------------------
-# Public hybrid constructors
+# Public constructors
 # ---------------------------------------------------------------------------
 
 def build_nes_hsja(
     nes_kwargs: Optional[dict] = None,
     hsja_kwargs: Optional[dict] = None,
-    stage1_query_fraction: float = 0.5,
+    stage1_time_fraction: float = 0.6,
 ):
-    """NES (score-based) → HSJA (decision-based) hybrid."""
-    nes = NESAttack(**(nes_kwargs or {}))
+    """NES → HSJA."""
+    nes  = NESAttack(**(nes_kwargs or {}))
     hsja = HSJAAttack(**(hsja_kwargs or {}))
-    hybrid = _wrap_hybrid("nes", nes, hsja)
-    hybrid.stage1_query_fraction = stage1_query_fraction
-    return hybrid
+    h = _make_hybrid("nes", nes, hsja)
+    h.stage1_time_fraction = stage1_time_fraction
+    return h
 
 
 def build_simba_hsja(
     simba_kwargs: Optional[dict] = None,
     hsja_kwargs: Optional[dict] = None,
-    stage1_query_fraction: float = 0.5,
+    stage1_time_fraction: float = 0.6,
 ):
-    """SimBa (score-based) → HSJA (decision-based) hybrid."""
+    """SimBa → HSJA."""
     simba = SimBaAttack(**(simba_kwargs or {}))
-    hsja = HSJAAttack(**(hsja_kwargs or {}))
-    hybrid = _wrap_hybrid("simba", simba, hsja)
-    hybrid.stage1_query_fraction = stage1_query_fraction
-    return hybrid
+    hsja  = HSJAAttack(**(hsja_kwargs or {}))
+    h = _make_hybrid("simba", simba, hsja)
+    h.stage1_time_fraction = stage1_time_fraction
+    return h
 
 
 def build_zo_hsja(
     zo_kwargs: Optional[dict] = None,
     hsja_kwargs: Optional[dict] = None,
-    stage1_query_fraction: float = 0.5,
+    stage1_time_fraction: float = 0.6,
 ):
-    """ZO-Sign-SGD (score-based) → HSJA (decision-based) hybrid."""
-    zo = ZOSignSGDAttack(**(zo_kwargs or {}))
+    """ZO-Sign-SGD → HSJA."""
+    zo   = ZOSignSGDAttack(**(zo_kwargs or {}))
     hsja = HSJAAttack(**(hsja_kwargs or {}))
-    hybrid = _wrap_hybrid("zo_sign_sgd", zo, hsja)
-    hybrid.stage1_query_fraction = stage1_query_fraction
-    return hybrid
+    h = _make_hybrid("zo_sign_sgd", zo, hsja)
+    h.stage1_time_fraction = stage1_time_fraction
+    return h

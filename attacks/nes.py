@@ -2,21 +2,25 @@
 
 NES (baseline):
     Monte Carlo gradient estimation via antithetic sampling.
-    Optimises a perturbation delta added to x0, so x = clip(x0 + delta).
-    This is the correct formulation: we never lose track of the base image.
+    Optimises delta (perturbation from x0): x_adv = clip(x0 + delta).
 
 Prokos (USENIX Security 2023):
-    NES + momentum (rho=0.5) + grayscale noise constraint.
+    NES + momentum (rho=0.5) + grayscale noise.
 
-Reference:
-    Prokos et al., "Squint Hard Enough: Attacking Perceptual Hashing
-    with Adversarial Machine Learning", USENIX Security 2023.
+Key design:
+  - Loop runs until oracle.budget_ok() returns False (time limit) or success.
+    max_iters removed — time is the only budget.
+  - Gradient estimated from x_cur = clip(x0 + delta), not from x0.
+    This is correct: we probe around the current best perturbation.
+  - After gradient step, delta is updated; x_new = clip(x0 + delta) is queried.
+    This is a separate query from the gradient probes — needed for accurate tracking.
+  - L2 metric: RMS (sqrt(mean(...))), consistent with utils.l2_img.
 """
 from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import List
 
 import numpy as np
 
@@ -25,6 +29,7 @@ from .base import AttackResult, AttackSpec
 
 
 def _l2(a: np.ndarray, b: np.ndarray) -> float:
+    """RMS L2 — consistent with utils.l2_img."""
     return float(np.sqrt(np.mean((a.astype(np.float64) - b.astype(np.float64)) ** 2)))
 
 
@@ -36,33 +41,31 @@ def _clip(x: np.ndarray) -> np.ndarray:
 class NESAttack:
     """NES with antithetic sampling.
 
-    Key design choices:
-    - Optimises delta (perturbation from x0), not x directly.
-      x_adv = clip(x0 + delta). This avoids drift and keeps L2 meaningful.
-    - sigma is in the perturbation domain (fraction of [0,1]), not image scale.
-      Good starting values: sigma=0.05..0.1 for most hashes.
-    - After each gradient step, only accept x if it improves the score.
-      (Greedy descent — avoids random walks when gradient is noisy.)
-
     Parameters
     ----------
     sigma : float
         Noise std for gradient estimation. In [0,1] image scale.
-        Typical: 0.05 (fine), 0.1 (coarse), 0.2 (very coarse for PDQ).
+        Too small → no signal through hash's quantization.
+        Too large → perturbation too far from current x.
+        Typical: 0.05..0.2. For pHash/PDQ: 0.1..0.3.
     lr : float
         Step size for delta update after each gradient estimate.
+        Typical: 0.01..0.1.
     n_samples : int
-        Antithetic pairs per gradient estimate (total queries = 2 * n_samples).
-    max_iters : int
-        Max gradient steps.
+        Antithetic pairs per gradient estimate.
+        More → lower variance gradient, but more queries per step.
+        Typical: 5..20.
     grayscale : bool
-        If True, use identical noise across RGB channels.
+        If True, identical noise across RGB channels (Prokos trick).
+    normalize_grad : bool
+        If True, normalize gradient to unit norm before lr step.
+        Helps with stability when landscape is flat.
     """
-    sigma: float = 0.05
+    sigma: float = 0.1
     lr: float = 0.01
     n_samples: int = 10
-    max_iters: int = 3000
     grayscale: bool = False
+    normalize_grad: bool = True
 
     spec: AttackSpec = field(init=False)
 
@@ -71,8 +74,9 @@ class NESAttack:
             attack_id="nes",
             params=dict(
                 sigma=self.sigma, lr=self.lr,
-                n_samples=self.n_samples, max_iters=self.max_iters,
+                n_samples=self.n_samples,
                 grayscale=self.grayscale,
+                normalize_grad=self.normalize_grad,
             ),
         )
 
@@ -88,20 +92,24 @@ class NESAttack:
 
         threshold = oracle.threshold
 
-        for _ in range(self.max_iters):
-            if best_dist <= threshold or not oracle.budget_ok():
-                break
-
+        while oracle.budget_ok() and best_dist > threshold:
             grad = self._estimate_grad(x0, delta, oracle)
             if grad is None:
-                break
+                break  # budget exhausted during grad estimation
 
-            # normalised gradient step on delta
-            norm = np.linalg.norm(grad)
-            if norm > 1e-12:
-                delta = delta - self.lr * grad / norm
+            # Gradient step on delta
+            if self.normalize_grad:
+                norm = np.linalg.norm(grad)
+                if norm > 1e-12:
+                    delta = delta - self.lr * grad / norm
+                else:
+                    # Flat landscape — random restart nudge
+                    delta = delta + self._sample_noise(delta.shape) * self.sigma * 0.1
             else:
-                delta = delta + np.random.randn(*delta.shape).astype(np.float32) * self.sigma * 0.1
+                delta = delta - self.lr * grad
+
+            if not oracle.budget_ok():
+                break
 
             x_new = _clip(x0 + delta)
             dist = oracle.query(x_new)
@@ -133,8 +141,8 @@ class NESAttack:
     def _estimate_grad(self, x0: np.ndarray, delta: np.ndarray, oracle: HashOracle):
         """Antithetic NES gradient estimate w.r.t. delta.
 
-        Evaluates f(clip(x0 + delta + sigma*p)) and f(clip(x0 + delta - sigma*p)).
-        Returns gradient array or None if budget exhausted.
+        Probes: f(clip(x0 + delta + sigma*p)) and f(clip(x0 + delta - sigma*p))
+        Returns gradient array or None if budget exhausted mid-estimation.
         """
         grad = np.zeros_like(delta)
         x_cur = _clip(x0 + delta)
@@ -160,18 +168,17 @@ class ProkosAttack(NESAttack):
     Parameters
     ----------
     rho : float
-        Momentum coefficient. delta_update = rho * prev + (1-rho) * grad.
+        Momentum coefficient: m = rho*m + (1-rho)*grad.
     """
     rho: float = 0.5
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "grayscale", True)
+        self.grayscale = True
         self.spec = AttackSpec(
             attack_id="prokos",
             params=dict(
                 sigma=self.sigma, lr=self.lr,
-                n_samples=self.n_samples, max_iters=self.max_iters,
-                rho=self.rho,
+                n_samples=self.n_samples, rho=self.rho,
             ),
         )
 
@@ -188,20 +195,19 @@ class ProkosAttack(NESAttack):
 
         threshold = oracle.threshold
 
-        for _ in range(self.max_iters):
-            if best_dist <= threshold or not oracle.budget_ok():
-                break
-
+        while oracle.budget_ok() and best_dist > threshold:
             grad = self._estimate_grad(x0, delta, oracle)
             if grad is None:
                 break
 
             norm = np.linalg.norm(grad)
-            g = grad / norm if norm > 1e-12 else np.random.randn(*grad.shape).astype(np.float32)
+            g = grad / norm if norm > 1e-12 else self._sample_noise(grad.shape)
 
-            # momentum update
             momentum = self.rho * momentum + (1 - self.rho) * g
             delta = delta - self.lr * momentum
+
+            if not oracle.budget_ok():
+                break
 
             x_new = _clip(x0 + delta)
             dist = oracle.query(x_new)

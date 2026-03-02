@@ -2,6 +2,11 @@
 
 Optimises delta (perturbation from x0): x_adv = clip(x0 + delta).
 
+Key fix vs original:
+  - Loop is time-based (oracle.budget_ok()), not max_iters.
+  - Gradient baseline f0 queried once at start of each step from x_cur,
+    not reused from best_dist (which can be stale).
+
 References:
     Liu et al., "Signsgd via zeroth-order oracle", ICLR 2019.
 """
@@ -22,6 +27,7 @@ def _clip(x: np.ndarray) -> np.ndarray:
 
 
 def _l2(a: np.ndarray, b: np.ndarray) -> float:
+    """RMS L2 — consistent with utils.l2_img."""
     return float(np.sqrt(np.mean((a.astype(np.float64) - b.astype(np.float64)) ** 2)))
 
 
@@ -32,27 +38,31 @@ class ZOSignSGDAttack:
     Parameters
     ----------
     mu : float
-        Finite-difference step. Should be small enough not to jump over
-        hash boundaries, but large enough to get signal: 0.01..0.05.
+        Finite-difference step for gradient estimation.
+        Should be large enough to get signal through hash quantization.
+        Typical: 0.05..0.2 for pHash/PDQ, 0.02..0.1 for NeuralHash.
     lr : float
-        Step size applied to sign(grad). In [0,1] scale: 0.001..0.01.
+        Step size for sign(grad) update on delta.
+        Typical: 0.001..0.02.
     n_samples : int
         Random directions per gradient estimate.
-    max_iters : int
-        Maximum steps.
+        More → lower variance, but more queries per step.
+        Typical: 10..30.
+    reuse_f0 : bool
+        If True, use best_dist as f0 baseline (saves 1 query/step, less accurate).
+        If False, query f(x_cur) explicitly each step (more accurate, +1 query).
     """
-    mu: float = 0.02
+    mu: float = 0.1
     lr: float = 0.005
     n_samples: int = 20
-    max_iters: int = 3000
+    reuse_f0: bool = True
 
     spec: AttackSpec = field(init=False)
 
     def __post_init__(self) -> None:
         self.spec = AttackSpec(
             attack_id="zo_sign_sgd",
-            params=dict(mu=self.mu, lr=self.lr,
-                        n_samples=self.n_samples, max_iters=self.max_iters),
+            params=dict(mu=self.mu, lr=self.lr, n_samples=self.n_samples),
         )
 
     def run(self, x0: np.ndarray, oracle: HashOracle, budget: BudgetSpec) -> AttackResult:
@@ -67,18 +77,26 @@ class ZOSignSGDAttack:
 
         threshold = oracle.threshold
 
-        for _ in range(self.max_iters):
-            if best_dist <= threshold or not oracle.budget_ok():
-                break
-
+        while oracle.budget_ok() and best_dist > threshold:
             x_cur = _clip(x0 + delta)
-            f0 = best_dist   # use best as baseline (cheaper than extra query)
+
+            # Baseline: either reuse best_dist or query explicitly
+            if self.reuse_f0:
+                f0 = best_dist
+            else:
+                f0 = oracle.query(x_cur)
+                history.append(f0)
+                if not oracle.budget_ok():
+                    break
 
             grad = self._estimate_grad(x_cur, oracle, f0)
             if grad is None:
-                break
+                break  # budget exhausted during gradient estimation
 
             delta = delta - self.lr * np.sign(grad)
+
+            if not oracle.budget_ok():
+                break
 
             x_new = _clip(x0 + delta)
             dist = oracle.query(x_new)

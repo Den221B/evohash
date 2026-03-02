@@ -17,18 +17,27 @@ class AttackSpec:
 
 @dataclass
 class AttackResult:
-    x_best: np.ndarray          # best adversarial candidate found
-    best_score: float           # hash distance at x_best (lower = better)
+    x_best: np.ndarray          # лучший adversarial кандидат
+    best_score: float           # hash distance (меньше = лучше)
     queries_used: int
     runtime_ms: int
-    stopped_reason: Optional[str] = None   # "success" | "budget" | "error"
-    history: List[float] = field(default_factory=list)  # distance per query
+    stopped_reason: Optional[str] = None   # "success" | "budget" | "no_init" | "error"
+    history: List[float] = field(default_factory=list)
     extra: Dict[str, Any] = field(default_factory=dict)
 
     @property
+    def runtime_s(self) -> float:
+        return self.runtime_ms / 1000.0
+
+    @property
     def l2(self) -> float:
-        """L2 distance stored in extra by attacks that track it."""
         return float(self.extra.get("l2", 0.0))
+
+    @property
+    def queries_per_sec(self) -> float:
+        if self.runtime_s > 0:
+            return self.queries_used / self.runtime_s
+        return 0.0
 
 
 @runtime_checkable
@@ -41,24 +50,22 @@ class Attack(Protocol):
         oracle: HashOracle,
         budget: BudgetSpec,
     ) -> AttackResult:
-        """Run the attack.
+        """Запустить атаку.
 
         Args:
-            x0:     Source image, float32 [0,1] HxWxC.
-            oracle: Black-box query interface.  oracle.query(x) returns
-                    hash distance to the target (lower = closer to collision).
-                    oracle also tracks query count and raises BudgetExceeded.
-            budget: Budget constraints (passed for seed access / logging).
+            x0:     Исходное изображение, float32 [0,1] HxWxC.
+            oracle: Black-box интерфейс. oracle.query(x) → дистанция до target hash.
+            budget: Бюджет (используется для seed и передачи в sub-атаки).
 
         Returns:
-            AttackResult with the best adversarial candidate found.
+            AttackResult с лучшим найденным кандидатом.
         """
         ...
 
 
 class AttackRegistry:
     def __init__(self) -> None:
-        self._reg: Dict[str, type] = {}
+        self._reg: Dict[str, Any] = {}
 
     def register(self, attack: Attack, *, overwrite: bool = False) -> None:
         aid = attack.spec.attack_id

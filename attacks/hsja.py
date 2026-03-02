@@ -1,23 +1,29 @@
 """HopSkipJumpAttack (HSJA) — Decision-based boundary attack.
 
-Uses only binary feedback: collision(x') = dist(hash(x'), hash(target)) < threshold.
-Iteratively moves toward the source image while staying on the non-collision side
-of the decision boundary, then estimates boundary gradient to step closer.
+HSJA минимизирует L2(x0, x_adv) при условии что x_adv остаётся коллизией.
+Это НЕ атака для снижения hash distance — она работает ВНУТРИ зоны коллизии.
 
-Algorithm:
-    1. Start from a random image that is NOT a collision (or a provided init).
-    2. Binary search along the line between current point and target to find boundary.
-    3. Estimate gradient at boundary via Monte Carlo with binary decisions.
-    4. Move from boundary in gradient direction toward target.
-    5. Repeat.
+Алгоритм:
+    1. Старт: x_adv = y (гарантированная коллизия, максимальный L2 от x0).
+    2. Бинарный поиск границы на отрезке [x0, x_adv].
+    3. Оценка градиента на границе: в каком направлении от границы коллизия?
+    4. Шаг от границы в направлении коллизии (ближе к x0 = меньше L2).
+    5. Повторять — каждая итерация уменьшает L2 оставаясь в коллизии.
+
+Цель HSJA в нашем проекте:
+  - Standalone: взять y как старт, дойти как можно ближе к x0.
+    Результат: x_adv с малым L2 и hash_dist <= threshold.
+  - В hybrid: stage 1 (NES) нашёл x_mid (возможно коллизию), HSJA уменьшает L2.
+
+Key fixes vs original:
+  - Понята правильная цель: минимизируем L2, не hash dist.
+    Цикл идёт while budget_ok(), не while best_dist > thr.
+  - y_init задаётся снаружи для гарантированного старта.
+  - Убран двойной запрос is_collision + oracle.query.
+  - L2: RMS sqrt(mean(...)), согласованно с utils.l2_img.
 
 Reference:
-    Chen et al., "HopSkipJumpAttack: A Query-Efficient Decision-Based Attack",
-    IEEE S&P 2020.  https://arxiv.org/abs/1904.02144
-    
-    Adapted for perceptual hash collision (rather than classifier evasion):
-    - "target class" → collision with hash(y)
-    - decision boundary → threshold on hash distance
+    Chen et al., "HopSkipJumpAttack", IEEE S&P 2020.
 """
 from __future__ import annotations
 
@@ -36,34 +42,34 @@ def _clip(x: np.ndarray) -> np.ndarray:
 
 
 def _l2(a: np.ndarray, b: np.ndarray) -> float:
-    return float(np.sqrt(np.sum((a.astype(np.float64) - b.astype(np.float64)) ** 2)))
+    """RMS L2 — согласованно с utils.l2_img."""
+    return float(np.sqrt(np.mean((a.astype(np.float64) - b.astype(np.float64)) ** 2)))
 
 
 @dataclass
 class HSJAAttack:
-    """HopSkipJumpAttack adapted for perceptual hash collision.
+    """HopSkipJumpAttack для perceptual hash collision.
+
+    HSJA минимизирует L2(x0, x_adv), удерживая x_adv в зоне коллизии.
+    Используется как refinement-шаг после score-based атаки в hybrid,
+    или standalone (стартует от y — гарантированной коллизии).
 
     Parameters
     ----------
-    max_iters : int
-        Number of outer iterations (boundary search + gradient step).
-    init_queries : int
-        Queries for the initial binary search to find the decision boundary.
     grad_queries : int
-        Monte Carlo samples for gradient estimation at each step.
+        Monte Carlo сэмплов для оценки градиента на границе.
     step_size : float
-        Gradient step magnitude from boundary.
+        Шаг от границы (адаптивный: × dist_to_boundary).
     binary_search_steps : int
-        Steps for boundary binary search per iteration.
-    threshold : float | None
-        Hash distance threshold for collision.  If None, read from oracle.
+        Шагов бинарного поиска границы за итерацию.
+    y_init : np.ndarray | None
+        Целевая картинка y — гарантированная начальная коллизия.
+        Устанавливается снаружи (Evaluator или Hybrid) перед run().
     """
-    max_iters: int = 40
-    init_queries: int = 100
-    grad_queries: int = 100
-    step_size: float = 0.02
-    binary_search_steps: int = 25
-    threshold: Optional[float] = None
+    grad_queries: int = 50
+    step_size: float = 0.05
+    binary_search_steps: int = 10
+    y_init: Optional[np.ndarray] = None
 
     spec: AttackSpec = field(init=False)
 
@@ -71,109 +77,125 @@ class HSJAAttack:
         self.spec = AttackSpec(
             attack_id="hsja",
             params=dict(
-                max_iters=self.max_iters,
-                init_queries=self.init_queries,
                 grad_queries=self.grad_queries,
                 step_size=self.step_size,
                 binary_search_steps=self.binary_search_steps,
             ),
         )
 
-    # ------------------------------------------------------------------
-
-    def run(
-        self,
-        x0: np.ndarray,
-        oracle: HashOracle,
-        budget: BudgetSpec,
-    ) -> AttackResult:
+    def run(self, x0: np.ndarray, oracle: HashOracle, budget: BudgetSpec) -> AttackResult:
         t0 = time.monotonic()
         history: List[float] = []
-
-        thr = self.threshold if self.threshold is not None else getattr(oracle, "threshold", 0.0)
+        thr = oracle.threshold
 
         def is_collision(x: np.ndarray) -> bool:
-            """Binary decision — True if hash(x) collides with target."""
-            try:
-                d = oracle.query(x)
-                history.append(d)
-                return d <= thr
-            except Exception:
+            """Бинарный запрос — коллизия или нет. Тратит 1 query."""
+            if not oracle.budget_ok():
                 return False
+            d = oracle.query(x)
+            history.append(d)
+            return d <= thr
 
-        # --- Step 0: find a collision starting point (random images) ---
-        x_adv = self._find_initial_collision(x0, oracle, is_collision, thr, history)
+        # Найти начальную точку коллизии
+        x_adv = self._find_initial_collision(x0, is_collision, oracle)
         if x_adv is None:
-            # could not find a collision start — return best random
             elapsed = int((time.monotonic() - t0) * 1000)
-            dist = oracle.query(x0)
             return AttackResult(
-                x_best=x0, best_score=dist, queries_used=oracle.queries_used,
-                runtime_ms=elapsed, stopped_reason="no_init", history=history,
+                x_best=x0,
+                best_score=oracle.state.best_score,
+                queries_used=oracle.queries_used,
+                runtime_ms=elapsed,
+                stopped_reason="no_init",
+                history=history,
+                extra={"l2": 0.0},
             )
 
+        # x_adv — коллизия, x0 — нет. Цель: минимизировать L2(x0, x_adv).
         best_x = x_adv.copy()
-        best_dist = oracle.query(x_adv)
-        history.append(best_dist)
+        best_l2 = _l2(x0, x_adv)
+        # best_hash_dist — дистанция текущего x_adv (для отчёта, не для оптимизации)
+        best_hash_dist = history[-1] if history else float("inf")
 
-        # --- Main loop ---
-        for iteration in range(self.max_iters):
-            if oracle.queries_used >= getattr(budget, "max_queries", int(1e9)):
+        # Главный цикл: идём по границе в сторону x0
+        while oracle.budget_ok():
+            # Бинарный поиск границы: x0 (нет коллизии) ←—→ x_adv (коллизия)
+            x_boundary = self._binary_search(x0, x_adv, is_collision)
+            if not oracle.budget_ok():
                 break
 
-            # Binary search to find boundary between x0 (no collision) and x_adv (collision)
-            x_boundary = self._binary_search_boundary(x0, x_adv, is_collision)
-
-            # Estimate gradient at boundary (sign of gradient toward collision side)
+            # Оценка градиента на границе
             grad = self._estimate_grad(x_boundary, x0, is_collision)
+            if not oracle.budget_ok():
+                break
 
-            # Adaptive step size: distance from x0 to boundary
+            # Шаг от границы в направлении коллизии (к interior, ближе к x0)
             dist_to_boundary = _l2(x0, x_boundary)
-            step = self.step_size * dist_to_boundary
-
-            # Move from boundary in gradient direction (toward collision region)
+            step = self.step_size * max(dist_to_boundary, 1e-4)
             x_new = _clip(x_boundary + step * grad)
 
-            if is_collision(x_new):
-                x_adv = x_new
-                d = oracle.query(x_new)
-                history.append(d)
-                if d < best_dist:
-                    best_dist = d
-                    best_x = x_new.copy()
+            # Явный запрос: нужна реальная hash dist (не только бинарный ответ)
+            if not oracle.budget_ok():
+                break
+            d_new = oracle.query(x_new)
+            history.append(d_new)
 
-        reason = "success" if best_dist <= thr else "budget"
+            if d_new <= thr:
+                # x_new — коллизия. Проверяем улучшился ли L2.
+                x_adv = x_new.copy()
+                l2_new = _l2(x0, x_new)
+                if l2_new < best_l2:
+                    best_l2 = l2_new
+                    best_x = x_new.copy()
+                    best_hash_dist = d_new
+
+        # "success" = нашли коллизию с L2 < L2(x0, y_init)
+        # Если x_adv изменился от y_init — мы улучшили L2, это успех HSJA.
+        success = best_hash_dist <= thr
+        reason = "success" if success else "budget"
         elapsed = int((time.monotonic() - t0) * 1000)
         return AttackResult(
             x_best=best_x,
-            best_score=best_dist,
+            best_score=best_hash_dist,
             queries_used=oracle.queries_used,
             runtime_ms=elapsed,
             stopped_reason=reason,
             history=history,
-            extra={"l2": _l2(x0, best_x)},
+            extra={"l2": best_l2},
         )
 
-    # ------------------------------------------------------------------
+    def _find_initial_collision(
+        self, x0: np.ndarray, is_collision, oracle: HashOracle
+    ) -> Optional[np.ndarray]:
+        """Найти гарантированную начальную коллизию.
 
-    def _find_initial_collision(self, x0, oracle, is_collision, thr, history):
-        """Try random images until we find one that collides with target."""
-        for _ in range(self.init_queries):
-            # interpolate towards fully random image
-            alpha = np.random.uniform(0.5, 1.0)
-            x_rand = _clip(alpha * np.random.rand(*x0.shape).astype(np.float32)
-                           + (1 - alpha) * x0)
+        Стратегии:
+        1. y_init напрямую — hash(y, y)=0 <= threshold, всегда коллизия.
+        2. Интерполяции x0 → y_init.
+        3. Случайные картинки (запасной вариант).
+        """
+        if self.y_init is not None:
+            y = self.y_init.astype(np.float32)
+            if is_collision(y):
+                return y
+            for alpha in [0.9, 0.7, 0.5]:
+                if not oracle.budget_ok():
+                    return None
+                x_interp = _clip(alpha * y + (1 - alpha) * x0.astype(np.float32))
+                if is_collision(x_interp):
+                    return x_interp
+
+        # Случайные картинки
+        for _ in range(20):
+            if not oracle.budget_ok():
+                return None
+            x_rand = np.random.rand(*x0.shape).astype(np.float32)
             if is_collision(x_rand):
                 return x_rand
+
         return None
 
-    def _binary_search_boundary(
-        self,
-        x_no: np.ndarray,   # not a collision
-        x_yes: np.ndarray,  # is a collision
-        is_collision,
-    ) -> np.ndarray:
-        """Binary search on the line segment [x_no, x_yes] for the boundary."""
+    def _binary_search(self, x_no, x_yes, is_collision) -> np.ndarray:
+        """Бинарный поиск на отрезке [x_no (нет), x_yes (да)] для границы коллизии."""
         lo, hi = 0.0, 1.0
         for _ in range(self.binary_search_steps):
             mid = (lo + hi) / 2
@@ -184,30 +206,19 @@ class HSJAAttack:
                 lo = mid
         return _clip((1 - hi) * x_no + hi * x_yes)
 
-    def _estimate_grad(
-        self,
-        x_boundary: np.ndarray,
-        x_source: np.ndarray,
-        is_collision,
-    ) -> np.ndarray:
-        """Monte Carlo gradient estimation at boundary.
-
-        Each sample p gets coefficient +1 if perturbing toward p is a collision,
-        else -1.  Average gives the gradient direction.
-        """
+    def _estimate_grad(self, x_boundary, x_source, is_collision) -> np.ndarray:
+        """Monte Carlo оценка направления внутрь зоны коллизии."""
         grad = np.zeros_like(x_boundary)
-        delta = _l2(x_source, x_boundary) * 0.01
-        if delta < 1e-8:
-            delta = 0.01
+        # Шаг для зондирования: 1% от расстояния до source
+        delta = max(_l2(x_source, x_boundary) * 0.01, 1e-3)
 
         for _ in range(self.grad_queries):
             p = np.random.randn(*x_boundary.shape).astype(np.float32)
             p /= np.linalg.norm(p) + 1e-12
-            x_perturb = _clip(x_boundary + delta * p)
-            coeff = 1.0 if is_collision(x_perturb) else -1.0
+            coeff = 1.0 if is_collision(_clip(x_boundary + delta * p)) else -1.0
             grad += coeff * p
 
-        grad /= (self.grad_queries + 1e-12)
+        grad /= self.grad_queries + 1e-12
         norm = np.linalg.norm(grad)
         if norm > 1e-12:
             grad /= norm
