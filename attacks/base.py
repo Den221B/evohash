@@ -1,90 +1,63 @@
-"""Base types for attack implementations."""
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Protocol, runtime_checkable
-
-import numpy as np
-
-from evohash.oracle import BudgetSpec, HashOracle
+from typing import Any, Dict, Optional, Protocol, runtime_checkable
 
 
 @dataclass(frozen=True)
 class AttackSpec:
+    """Metadata about an attack algorithm."""
     attack_id: str
-    params: Dict[str, Any] = field(default_factory=dict)
+    name: str
+    description: str = ""
 
 
 @dataclass
 class AttackResult:
-    x_best: np.ndarray          # лучший adversarial кандидат
-    best_score: float           # hash distance (меньше = лучше)
+    """Result of running an attack on a single (image, hash) instance."""
+    success: bool
+    best_dist: float
     queries_used: int
-    runtime_ms: int
-    stopped_reason: Optional[str] = None   # "success" | "budget" | "no_init" | "error"
-    history: List[float] = field(default_factory=list)
+
+    # Best candidate found (optional, depending on attack implementation)
+    best_x: Optional[Any] = None
+
+    # Per-iteration history; attack may store whatever it wants here
+    history: Dict[str, Any] = field(default_factory=dict)
+
+    # Additional debug info / config dump / timings, etc.
     extra: Dict[str, Any] = field(default_factory=dict)
-
-    @property
-    def runtime_s(self) -> float:
-        return self.runtime_ms / 1000.0
-
-    @property
-    def l2(self) -> float:
-        return float(self.extra.get("l2", 0.0))
-
-    @property
-    def queries_per_sec(self) -> float:
-        if self.runtime_s > 0:
-            return self.queries_used / self.runtime_s
-        return 0.0
 
 
 @runtime_checkable
 class Attack(Protocol):
+    """Attack interface."""
     spec: AttackSpec
 
-    def run(
-        self,
-        x0: np.ndarray,
-        oracle: HashOracle,
-        budget: BudgetSpec,
-    ) -> AttackResult:
-        """Запустить атаку.
-
-        Args:
-            x0:     Исходное изображение, float32 [0,1] HxWxC.
-            oracle: Black-box интерфейс. oracle.query(x) → дистанция до target hash.
-            budget: Бюджет (используется для seed и передачи в sub-атаки).
-
-        Returns:
-            AttackResult с лучшим найденным кандидатом.
-        """
+    def run(self, x0, oracle, budget) -> AttackResult:
         ...
 
 
 class AttackRegistry:
+    """Simple registry of attack instances."""
     def __init__(self) -> None:
-        self._reg: Dict[str, Any] = {}
+        self._reg: Dict[str, Attack] = {}
 
-    def register(self, attack: Attack, *, overwrite: bool = False) -> None:
+    def register(self, attack: Attack) -> None:
+        if not hasattr(attack, "spec") or not getattr(attack, "spec", None):
+            raise TypeError("Attack must have a .spec field (AttackSpec).")
         aid = attack.spec.attack_id
-        if aid in self._reg and not overwrite:
-            raise ValueError(
-                f"Attack '{aid}' already registered. Use overwrite=True to replace."
-            )
+        if aid in self._reg:
+            raise KeyError(f"Attack '{aid}' already registered.")
         self._reg[aid] = attack
 
     def get(self, attack_id: str) -> Attack:
         if attack_id not in self._reg:
-            raise KeyError(
-                f"Unknown attack_id '{attack_id}'. "
-                f"Registered: {self.list_ids()}"
-            )
+            raise KeyError(f"Unknown attack '{attack_id}'. Available: {list(self._reg.keys())}")
         return self._reg[attack_id]
 
-    def list_ids(self) -> List[str]:
-        return sorted(self._reg.keys())
+    def list_ids(self) -> list[str]:
+        return list(self._reg.keys())
 
-    def __contains__(self, attack_id: str) -> bool:
-        return attack_id in self._reg
+    def items(self):
+        return self._reg.items()

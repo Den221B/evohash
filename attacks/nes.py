@@ -1,230 +1,287 @@
-"""Natural Evolution Strategies (NES) and Prokos variant.
-
-NES (baseline):
-    Monte Carlo gradient estimation via antithetic sampling.
-    Optimises delta (perturbation from x0): x_adv = clip(x0 + delta).
-
-Prokos (USENIX Security 2023):
-    NES + momentum (rho=0.5) + grayscale noise.
-
-Key design:
-  - Loop runs until oracle.budget_ok() returns False (time limit) or success.
-    max_iters removed — time is the only budget.
-  - Gradient estimated from x_cur = clip(x0 + delta), not from x0.
-    This is correct: we probe around the current best perturbation.
-  - After gradient step, delta is updated; x_new = clip(x0 + delta) is queried.
-    This is a separate query from the gradient probes — needed for accurate tracking.
-  - L2 metric: RMS (sqrt(mean(...))), consistent with utils.l2_img.
-"""
 from __future__ import annotations
 
-import time
-from dataclasses import dataclass, field
-from typing import List
+from dataclasses import dataclass
+from typing import Optional, Dict, Any
 
 import numpy as np
 
-from evohash.oracle import BudgetSpec, HashOracle
-from .base import AttackResult, AttackSpec
+from .base import AttackSpec, AttackResult
 
 
-def _l2(a: np.ndarray, b: np.ndarray) -> float:
-    """RMS L2 — consistent with utils.l2_img."""
-    return float(np.sqrt(np.mean((a.astype(np.float64) - b.astype(np.float64)) ** 2)))
+def _get_seed(budget) -> int:
+    # Robust seed retrieval (works even if budget doesn't have seed)
+    s = getattr(budget, "seed", None)
+    if s is None:
+        return 0
+    try:
+        return int(s) & 0xFFFFFFFF
+    except Exception:
+        return 0
 
 
-def _clip(x: np.ndarray) -> np.ndarray:
+def _as_float01(x):
+    # Ensure float32 in [0,1]
+    x = np.asarray(x)
+    if x.dtype == np.uint8:
+        return x.astype(np.float32) / 255.0
+    x = x.astype(np.float32)
+    # If it's likely in [0,255], rescale
+    mx = float(np.max(x)) if x.size else 0.0
+    if mx > 1.5:
+        x = x / 255.0
     return np.clip(x, 0.0, 1.0)
+
+
+def _apply_grayscale_noise(p: np.ndarray) -> np.ndarray:
+    # Make noise identical across channels
+    if p.ndim == 3 and p.shape[-1] == 3:
+        g = p.mean(axis=2, keepdims=True)
+        return np.repeat(g, 3, axis=2)
+    return p
+
+
+def _normalize(v: np.ndarray, eps: float = 1e-12) -> np.ndarray:
+    n = float(np.linalg.norm(v.ravel(), ord=2))
+    if n < eps:
+        return np.zeros_like(v)
+    return v / (n + eps)
 
 
 @dataclass
 class NESAttack:
-    """NES with antithetic sampling.
-
-    Parameters
-    ----------
-    sigma : float
-        Noise std for gradient estimation. In [0,1] image scale.
-        Too small → no signal through hash's quantization.
-        Too large → perturbation too far from current x.
-        Typical: 0.05..0.2. For pHash/PDQ: 0.1..0.3.
-    lr : float
-        Step size for delta update after each gradient estimate.
-        Typical: 0.01..0.1.
-    n_samples : int
-        Antithetic pairs per gradient estimate.
-        More → lower variance gradient, but more queries per step.
-        Typical: 5..20.
-    grayscale : bool
-        If True, identical noise across RGB channels (Prokos trick).
-    normalize_grad : bool
-        If True, normalize gradient to unit norm before lr step.
-        Helps with stability when landscape is flat.
     """
-    sigma: float = 0.1
-    lr: float = 0.01
-    n_samples: int = 10
+    NES-like gradient-free attack using antithetic sampling.
+
+    Minimizes oracle distance: f(x) = oracle.query(x) (or score).
+    Uses symmetric difference: (f(x+σp) - f(x-σp)) * p / (2σ).
+    """
+    sigma: float = 0.05
+    lr: float = 0.02
+    n_samples: int = 20
+    antithetic: bool = True
     grayscale: bool = False
     normalize_grad: bool = True
 
-    spec: AttackSpec = field(init=False)
+    spec: AttackSpec = AttackSpec(
+        attack_id="nes",
+        name="NES",
+        description="NES-style gradient estimator with (optional) antithetic sampling and grad normalization.",
+    )
 
-    def __post_init__(self) -> None:
-        self.spec = AttackSpec(
-            attack_id="nes",
-            params=dict(
-                sigma=self.sigma, lr=self.lr,
-                n_samples=self.n_samples,
-                grayscale=self.grayscale,
-                normalize_grad=self.normalize_grad,
-            ),
-        )
+    def _sample_noise(self, rng: np.random.Generator, shape) -> np.ndarray:
+        p = rng.standard_normal(size=shape, dtype=np.float32)
+        if self.grayscale:
+            p = _apply_grayscale_noise(p)
+        return p
 
-    def run(self, x0: np.ndarray, oracle: HashOracle, budget: BudgetSpec) -> AttackResult:
-        t0 = time.monotonic()
-        x0 = x0.astype(np.float32)
-        delta = np.zeros_like(x0)
-        history: List[float] = []
+    def run(self, x0, oracle, budget) -> AttackResult:
+        x0 = _as_float01(x0)
+        seed = _get_seed(budget)
+        rng = np.random.default_rng(seed)
 
-        best_dist = oracle.query(x0)
-        best_x = x0.copy()
-        history.append(best_dist)
+        threshold = getattr(oracle, "threshold_p", None)
+        eps = 1e-12
 
-        threshold = oracle.threshold
+        delta = np.zeros_like(x0, dtype=np.float32)
+        best_dist = float(getattr(oracle.state, "best_dist", np.inf))
+        best_x = getattr(oracle.state, "best_x", None)
 
-        while oracle.budget_ok() and best_dist > threshold:
-            grad = self._estimate_grad(x0, delta, oracle)
-            if grad is None:
-                break  # budget exhausted during grad estimation
+        hist: Dict[str, Any] = {
+            "dist": [],
+            "best_dist": [],
+        }
 
-            # Gradient step on delta
-            if self.normalize_grad:
-                norm = np.linalg.norm(grad)
-                if norm > 1e-12:
-                    delta = delta - self.lr * grad / norm
-                else:
-                    # Flat landscape — random restart nudge
-                    delta = delta + self._sample_noise(delta.shape) * self.sigma * 0.1
-            else:
-                delta = delta - self.lr * grad
+        # Ensure oracle has baseline (optional)
+        # We operate using oracle.query which should increment queries.
+        while oracle.budget_ok():
+            x_cur = oracle.project(x0 + delta)
+            base = oracle.query(x_cur)
 
-            if not oracle.budget_ok():
+            # Track best
+            best_dist = float(getattr(oracle.state, "best_dist", base))
+            best_x = getattr(oracle.state, "best_x", x_cur)
+
+            hist["dist"].append(float(base))
+            hist["best_dist"].append(best_dist)
+
+            # Early success stop
+            if threshold is not None and best_dist <= float(threshold):
                 break
 
-            x_new = _clip(x0 + delta)
-            dist = oracle.query(x_new)
-            history.append(dist)
+            # Estimate gradient
+            grad = np.zeros_like(delta, dtype=np.float32)
 
-            if dist < best_dist:
-                best_dist = dist
-                best_x = x_new.copy()
+            # Each sample may consume 2 queries (antithetic) or 1 (one-sided)
+            for _ in range(self.n_samples):
+                if not oracle.budget_ok():
+                    break
+                p = self._sample_noise(rng, delta.shape)
 
-        reason = "success" if best_dist <= threshold else "budget"
-        elapsed = int((time.monotonic() - t0) * 1000)
+                if self.antithetic:
+                    x_p = oracle.project(x0 + (delta + self.sigma * p))
+                    dp = oracle.query(x_p)
+                    if not oracle.budget_ok():
+                        break
+                    x_n = oracle.project(x0 + (delta - self.sigma * p))
+                    dn = oracle.query(x_n)
+                    grad += (float(dp) - float(dn)) * p
+                else:
+                    x_p = oracle.project(x0 + (delta + self.sigma * p))
+                    dp = oracle.query(x_p)
+                    grad += (float(dp) - float(base)) * p
+
+            denom = (2.0 * self.n_samples * self.sigma) if self.antithetic else (self.n_samples * self.sigma)
+            if denom > 0:
+                grad = grad / float(denom)
+
+            if self.normalize_grad:
+                grad = _normalize(grad, eps=eps)
+
+            # Gradient descent step on delta (minimize distance)
+            delta = delta - float(self.lr) * grad
+
+        # Final result from oracle state
+        best_dist = float(getattr(oracle.state, "best_dist", best_dist))
+        best_x = getattr(oracle.state, "best_x", best_x)
+        success = (threshold is not None and best_dist <= float(threshold))
+
         return AttackResult(
-            x_best=best_x,
-            best_score=best_dist,
-            queries_used=oracle.queries_used,
-            runtime_ms=elapsed,
-            stopped_reason=reason,
-            history=history,
-            extra={"l2": _l2(x0, best_x)},
+            success=bool(success),
+            best_dist=best_dist,
+            queries_used=int(getattr(oracle, "queries_used", 0)),
+            best_x=best_x,
+            history=hist,
+            extra={
+                "seed": seed,
+                "sigma": self.sigma,
+                "lr": self.lr,
+                "n_samples": self.n_samples,
+                "antithetic": self.antithetic,
+                "grayscale": self.grayscale,
+                "normalize_grad": self.normalize_grad,
+            },
         )
-
-    def _sample_noise(self, shape) -> np.ndarray:
-        if self.grayscale and len(shape) == 3 and shape[2] == 3:
-            h, w, _ = shape
-            n = np.random.randn(h, w, 1).astype(np.float32)
-            return np.repeat(n, 3, axis=2)
-        return np.random.randn(*shape).astype(np.float32)
-
-    def _estimate_grad(self, x0: np.ndarray, delta: np.ndarray, oracle: HashOracle):
-        """Antithetic NES gradient estimate w.r.t. delta.
-
-        Probes: f(clip(x0 + delta + sigma*p)) and f(clip(x0 + delta - sigma*p))
-        Returns gradient array or None if budget exhausted mid-estimation.
-        """
-        grad = np.zeros_like(delta)
-        x_cur = _clip(x0 + delta)
-
-        for _ in range(self.n_samples):
-            if not oracle.budget_ok():
-                return None
-            p = self._sample_noise(delta.shape)
-            xp = _clip(x_cur + self.sigma * p)
-            xn = _clip(x_cur - self.sigma * p)
-            dp = oracle.query(xp)
-            dn = oracle.query(xn)
-            grad += (dp - dn) * p
-
-        grad /= (2 * self.n_samples * self.sigma)
-        return grad
 
 
 @dataclass
-class ProkosAttack(NESAttack):
-    """Prokos et al. USENIX 2023: NES + momentum + grayscale.
-
-    Parameters
-    ----------
-    rho : float
-        Momentum coefficient: m = rho*m + (1-rho)*grad.
+class ProkosAttack:
     """
+    Prokos-style MC gradient estimator (USENIX'23):
+      base = f(x)
+      for j in 1..q: p~N(0,1), c = f(x+σp) - base, grad += c * p
+      g = Norm(grad/q)
+      with momentum: m = ρ m + (1-ρ) g
+      step: delta -= lr * m
+
+    Optional double-sample uses both +p and -p (extra queries).
+    """
+    sigma: float = 0.05
+    lr: float = 0.02
+    n_samples: int = 20
     rho: float = 0.5
+    double_sample: bool = False
+    grayscale: bool = False
+    normalize_grad: bool = True
 
-    def __post_init__(self) -> None:
-        self.grayscale = True
-        self.spec = AttackSpec(
-            attack_id="prokos",
-            params=dict(
-                sigma=self.sigma, lr=self.lr,
-                n_samples=self.n_samples, rho=self.rho,
-            ),
-        )
+    spec: AttackSpec = AttackSpec(
+        attack_id="prokos",
+        name="Prokos",
+        description="Prokos-style MC gradient estimator with Norm(grad) and momentum; optional double-sample.",
+    )
 
-    def run(self, x0: np.ndarray, oracle: HashOracle, budget: BudgetSpec) -> AttackResult:
-        t0 = time.monotonic()
-        x0 = x0.astype(np.float32)
-        delta = np.zeros_like(x0)
-        momentum = np.zeros_like(x0)
-        history: List[float] = []
+    def _sample_noise(self, rng: np.random.Generator, shape) -> np.ndarray:
+        p = rng.standard_normal(size=shape, dtype=np.float32)
+        if self.grayscale:
+            p = _apply_grayscale_noise(p)
+        return p
 
-        best_dist = oracle.query(x0)
-        best_x = x0.copy()
-        history.append(best_dist)
+    def run(self, x0, oracle, budget) -> AttackResult:
+        x0 = _as_float01(x0)
+        seed = _get_seed(budget)
+        rng = np.random.default_rng(seed)
 
-        threshold = oracle.threshold
+        threshold = getattr(oracle, "threshold_p", None)
+        eps = 1e-12
 
-        while oracle.budget_ok() and best_dist > threshold:
-            grad = self._estimate_grad(x0, delta, oracle)
-            if grad is None:
+        delta = np.zeros_like(x0, dtype=np.float32)
+        mom = np.zeros_like(x0, dtype=np.float32)
+
+        hist: Dict[str, Any] = {
+            "dist": [],
+            "best_dist": [],
+            "grad_norm": [],
+        }
+
+        while oracle.budget_ok():
+            x_cur = oracle.project(x0 + delta)
+            base = oracle.query(x_cur)
+
+            best_dist = float(getattr(oracle.state, "best_dist", base))
+            best_x = getattr(oracle.state, "best_x", x_cur)
+
+            hist["dist"].append(float(base))
+            hist["best_dist"].append(best_dist)
+
+            if threshold is not None and best_dist <= float(threshold):
                 break
 
-            norm = np.linalg.norm(grad)
-            g = grad / norm if norm > 1e-12 else self._sample_noise(grad.shape)
+            grad = np.zeros_like(delta, dtype=np.float32)
 
-            momentum = self.rho * momentum + (1 - self.rho) * g
-            delta = delta - self.lr * momentum
+            # Prokos one-sided estimator
+            # Each sample consumes 1 query (or 2 if double_sample)
+            for _ in range(self.n_samples):
+                if not oracle.budget_ok():
+                    break
+                p = self._sample_noise(rng, delta.shape)
 
-            if not oracle.budget_ok():
-                break
+                x_p = oracle.project(x0 + (delta + self.sigma * p))
+                fp = oracle.query(x_p)
+                c = float(fp) - float(base)
+                grad += c * p
 
-            x_new = _clip(x0 + delta)
-            dist = oracle.query(x_new)
-            history.append(dist)
+                if self.double_sample:
+                    if not oracle.budget_ok():
+                        break
+                    x_n = oracle.project(x0 + (delta - self.sigma * p))
+                    fn = oracle.query(x_n)
+                    c2 = float(fn) - float(base)
+                    grad += c2 * (-p)
 
-            if dist < best_dist:
-                best_dist = dist
-                best_x = x_new.copy()
+            grad = grad / float(max(self.n_samples, 1))
 
-        reason = "success" if best_dist <= threshold else "budget"
-        elapsed = int((time.monotonic() - t0) * 1000)
+            # Norm(g) from the paper
+            if self.normalize_grad:
+                g = _normalize(grad, eps=eps)
+            else:
+                g = grad
+
+            hist["grad_norm"].append(float(np.linalg.norm(g.ravel(), ord=2)))
+
+            # Momentum from the paper
+            rho = float(self.rho)
+            mom = rho * mom + (1.0 - rho) * g
+
+            # Step
+            delta = delta - float(self.lr) * mom
+
+        best_dist = float(getattr(oracle.state, "best_dist", np.inf))
+        best_x = getattr(oracle.state, "best_x", None)
+        success = (threshold is not None and best_dist <= float(threshold))
+
         return AttackResult(
-            x_best=best_x,
-            best_score=best_dist,
-            queries_used=oracle.queries_used,
-            runtime_ms=elapsed,
-            stopped_reason=reason,
-            history=history,
-            extra={"l2": _l2(x0, best_x)},
+            success=bool(success),
+            best_dist=best_dist,
+            queries_used=int(getattr(oracle, "queries_used", 0)),
+            best_x=best_x,
+            history=hist,
+            extra={
+                "seed": seed,
+                "sigma": self.sigma,
+                "lr": self.lr,
+                "n_samples": self.n_samples,
+                "rho": self.rho,
+                "double_sample": self.double_sample,
+                "grayscale": self.grayscale,
+                "normalize_grad": self.normalize_grad,
+            },
         )
