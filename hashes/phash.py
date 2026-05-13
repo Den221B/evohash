@@ -1,67 +1,52 @@
-"""pHash wrapper using the `imagehash` library.
+"""pHash wrapper.
 
-Install: pip install ImageHash
+Dependency:
+    pip install ImageHash
+
+Digest:
+    np.ndarray uint8, shape (64,), values {0, 1}
+Distance:
+    hash_l1 over the bit vector; equivalent to Hamming distance.
+Threshold:
+    12 by default.
 """
-from __future__ import annotations
 
-from typing import Any
+from __future__ import annotations
 
 import numpy as np
 from PIL import Image
 
-from .base import HashSpec, HashFunction
+from .base import HashSpec, binary_l1, to_uint8_rgb
 
 
 class PHashWrapper:
-    """Perceptual hash via DCT (pHash).
-
-    Digest type  : imagehash.ImageHash  (supports - operator → Hamming distance)
-    Distance     : Hamming
-    Threshold    : 12 (images with distance ≤ 12 considered similar)
-    """
-
     def __init__(self, threshold_p: float = 12.0) -> None:
         try:
-            import imagehash  # noqa: F401
-        except ImportError as e:
-            raise ImportError(
-                "imagehash not installed. Run: pip install ImageHash"
-            ) from e
-        import imagehash as _ih
-        self._ih = _ih
+            import imagehash
+        except ImportError as exc:
+            raise ImportError("imagehash is not installed. Run: pip install ImageHash") from exc
+
+        self._imagehash = imagehash
         self.spec = HashSpec(
             hash_id="phash",
             threshold_p=float(threshold_p),
-            distance_name="hamming",
+            distance_name="hash_l1",
         )
 
+    @property
+    def hash_id(self) -> str:
+        return self.spec.hash_id
+
+    @property
+    def threshold(self) -> float:
+        return self.spec.threshold_p
+
     def compute(self, image: np.ndarray) -> np.ndarray:
-        img = _to_uint8(image)
+        img = to_uint8_rgb(image)
         pil = Image.fromarray(img).convert("RGB")
-        ih = self._ih.phash(pil)
-        # конвертировать в uint8 биты (64,) — единый формат
-        int_val = int(str(ih), 16)
-        bits = np.array([(int_val >> (63 - i)) & 1 for i in range(64)], dtype=np.uint8)
-        return bits
+        digest = self._imagehash.phash(pil)
+        # imagehash.ImageHash.hash is a boolean matrix, normally 8x8.
+        return np.asarray(digest.hash, dtype=np.uint8).reshape(-1)
 
     def distance(self, d1: np.ndarray, d2: np.ndarray) -> float:
-        return float(np.count_nonzero(
-            np.asarray(d1, dtype=np.uint8) != np.asarray(d2, dtype=np.uint8)
-        ))
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _to_uint8(image: np.ndarray) -> np.ndarray:
-    """Accept uint8 [0,255] or float32 [0,1]; always return uint8 HxWx3."""
-    if image.dtype == np.uint8:
-        arr = image
-    else:
-        arr = np.clip(image.astype(np.float32) * 255.0, 0, 255).astype(np.uint8)
-    if arr.ndim == 2:
-        arr = np.stack([arr, arr, arr], axis=-1)
-    elif arr.shape[-1] == 4:
-        arr = arr[..., :3]
-    return arr
+        return binary_l1(d1, d2)

@@ -1,8 +1,11 @@
 """Hash functions registry and implementations."""
-from .base import HashSpec, HashFunction, HashRegistry
-from .phash import PHashWrapper
-from .pdq import PDQWrapper
+
+from __future__ import annotations
+
+from .base import HashFunction, HashRegistry, HashSpec
 from .neuralhash import NeuralHashWrapper
+from .pdq import PDQWrapper
+from .phash import PHashWrapper
 from .photodna import PhotoDNAWrapper, setup_photodna
 
 __all__ = [
@@ -24,25 +27,17 @@ def build_default_registry(
     pdq: bool = True,
     neuralhash: bool = False,
     photodna: bool = False,
-    neuralhash_model_dir: str = "",  # "" → evohash/hashes/model/ (bundled)
-    photodna_work_dir: str = "",     # "" → ~/.cache/photodna
+    neuralhash_model_dir: str = "",
+    photodna_work_dir: str = "",
+    photodna_dll_path: str = "",
 ) -> HashRegistry:
-    """Build a HashRegistry with the requested hash functions.
+    """Build registry with selected hash wrappers.
 
-    pHash and PDQ are enabled by default.
-    NeuralHash requires model files in evohash/hashes/model/.
-    PhotoDNA requires setup_photodna() to have been called first.
-
-    Parameters
-    ----------
-    neuralhash_model_dir : str
-        Override directory for model.onnx / model.dat.
-        Leave empty to use bundled evohash/hashes/model/.
-    photodna_work_dir : str
-        Override work dir for PhotoDNA (DLL + Wine Python).
-        Leave empty to use ~/.cache/photodna.
+    pHash and PDQ are enabled by default. NeuralHash and PhotoDNA are optional
+    because they need model/DLL setup.
     """
     reg = HashRegistry()
+
     if phash:
         reg.register(PHashWrapper())
     if pdq:
@@ -51,6 +46,11 @@ def build_default_registry(
         kwargs = {"model_dir": neuralhash_model_dir} if neuralhash_model_dir else {}
         reg.register(NeuralHashWrapper(**kwargs))
     if photodna:
-        kwargs = {"work_dir": photodna_work_dir} if photodna_work_dir else {}
+        kwargs = {}
+        if photodna_work_dir:
+            kwargs["work_dir"] = photodna_work_dir
+        if photodna_dll_path:
+            kwargs["dll_path"] = photodna_dll_path
         reg.register(PhotoDNAWrapper(**kwargs))
+
     return reg

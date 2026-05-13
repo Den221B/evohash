@@ -1,0 +1,136 @@
+{
+  "source": "Clean attack configuration for EvoHash experiments",
+  "image_scale": "float32 [0,1] for attack math and L2",
+  "hashes": [
+    "pdq",
+    "phash",
+    "neuralhash",
+    "photodna"
+  ],
+  "allowed_attacks": [
+    "nes",
+    "prokos",
+    "nes_attack_v0",
+    "simba",
+    "zo_signsgd",
+    "atkscopes"
+  ],
+  "note": "Resize and runtime budget are infrastructure-level settings. Attack configs contain only algorithm hyperparameters; use defaults.budget unless an explicit caller override is needed.",
+  "defaults": {
+    "seed": 0,
+    "budget": 20000
+  },
+  "configs": {
+    "pdq": {
+      "nes": {
+        "profile": "clean_raw_fd",
+        "max_iters": 300,
+        "n_samples": 20,
+        "sigma": 0.5,
+        "lr": 0.01
+      },
+      "prokos": {
+        "profile": "clean_ema_one_sided",
+        "max_iters": 300,
+        "n_samples": 20,
+        "sigma": 0.5,
+        "lr": 10.0,
+        "momentum": 0.5,
+        "antithetic": false,
+        "grayscale_noise": true
+      },
+      "nes_attack_v0": {
+        "profile": "evo_v2_delta_accum",
+        "max_iters": 300,
+        "n_samples": 20,
+        "sigma": 0.5,
+        "lr": 10.0,
+        "momentum": 0.5,
+        "grayscale_noise": true
+      },
+      "atkscopes": {
+        "profile": "working_global_dct_pdq",
+        "scale": "global",
+        "max_iters": 8000,
+        "a": 1.5,
+        "lr": 1.0,
+        "max_freq": 16,
+        "beta1": 0.9,
+        "beta2": 0.999,
+        "eps": 1e-08,
+        "log_every": 20
+      },
+      "simba": {
+        "profile": "working_dct_strided_pdq_256",
+        "basis": "dct",
+        "order": "strided",
+        "freq_dims": 10,
+        "stride": 1,
+        "epsilon": 7.450980392156863,
+        "max_iters": 9999,
+        "source_units_note": "Notebook value epsilon=1900 in [0,255], converted exactly by /255. Do not round to 8: PDQ SimBA is path-sensitive."
+      },
+      "zo_signsgd": {
+        "profile": "working_central_gaussian_pdq_256",
+        "estimator": "central",
+        "direction_dist": "gaussian",
+        "q": 16,
+        "mu": 0.06274509803921569,
+        "lr": 0.047058823529411764,
+        "max_iters": 300,
+        "eval_updated_point": true,
+        "source_units_note": "Notebook values mu=16, lr=12 in [0,255], converted by /255."
+      }
+    },
+    "phash": {
+      "atkscopes": {
+        "profile": "working_global_dct_phash_fast",
+        "scale": "global",
+        "max_iters": 4000,
+        "a": 10.0,
+        "lr": 3.0,
+        "max_freq": 8,
+        "beta1": 0.9,
+        "beta2": 0.999,
+        "eps": 1e-08,
+        "log_every": 10
+      }
+    },
+    "neuralhash": {
+      "atkscopes": {
+        "profile": "candidate_global_dct_neuralhash_aggressive",
+        "scale": "global",
+        "max_iters": 10000,
+        "a": 8.0,
+        "lr": 4.0,
+        "max_freq": 16,
+        "beta1": 0.9,
+        "beta2": 0.999,
+        "eps": 1e-08,
+        "log_every": 250
+      }
+    },
+    "photodna": {
+      "atkscopes": {
+        "profile": "validated_mid_dct_photodna_fast_pair0",
+        "scale": "mid",
+        "max_iters": 8000,
+        "a": 15.0,
+        "lr": 5.0,
+        "patch_size": 64,
+        "max_freq": 8,
+        "beta1": 0.9,
+        "beta2": 0.999,
+        "eps": 1e-08,
+        "log_every": 100
+      }
+    }
+  },
+  "preprocess": {
+    "resize_size": 256,
+    "resize_resample": "bilinear"
+  },
+  "thresholds": {
+    "pdq": 92.0
+  }
+}

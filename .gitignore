@@ -1,0 +1,20 @@
+# Python/cache artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.ipynb_checkpoints/
+
+# Local notebooks and experiment artifacts
+notebooks/
+outputs/
+runs_sweep/
+
+# Local datasets / generated reports
+*.zip
+*.xlsx
+*.csv
+
+# Results are local by default; keep only the curated attack config.
+results/*
+!results/
+!results/attack_configs.json

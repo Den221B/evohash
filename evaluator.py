@@ -1,168 +1,291 @@
-"""Evaluator: runs attacks against hash functions and records results.
-
-Design principles:
-  - Evaluator never trusts AttackResult directly. It re-computes the final
-    hash distance from scratch on x_best.
-  - All results are plain dataclasses (EvalRow) — easy to serialize to JSON/CSV.
-  - run_eval_on_ds() is the main entry point for bulk evaluation.
-"""
+"""Evaluator: final source of truth for attack metrics."""
 from __future__ import annotations
 
 import time
 from dataclasses import asdict, dataclass, field
-from typing import Any, Callable, Dict, Iterable, List, Optional
+from typing import Any, Iterable, Optional
 
 import numpy as np
 
-from evohash.attacks.base import AttackRegistry
-from evohash.dataset import Dataset, PairSample
-from evohash.hashes.base import HashRegistry
+from evohash.attacks.base import AttackRawResult, RegisteredAttack
+from evohash.metrics import (
+    compute_pixel_l2,
+    compute_pixel_l2_raw,
+    compute_relative_improvement,
+    to_float32,
+)
 from evohash.oracle import BudgetSpec, ConstraintSpec, HashOracle
-from evohash.utils import l2_img, to_float32
+from evohash.preprocessing import ResizeSpec, apply_resize
 
 
 @dataclass
 class EvalRow:
-    pair_id: str
+    pair_id: str | None
     hash_id: str
     attack_id: str
     seed: int
-    success: bool
-    d_hash: float       # hash distance of x_best from target hash
-    d_img: float        # pixel L2 distance between x_best and x0
-    queries_used: int
-    runtime_ms: int
-    stopped_reason: Optional[str] = None
-    extra: Dict[str, Any] = field(default_factory=dict)
 
-    def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+    initial_hash_l1: float
+    final_hash_l1: float
+    best_hash_l1: float
+    threshold: float
+    success: bool
+    improved: bool
+    relative_improvement: float
+
+    pixel_l2: float
+    pixel_l2_raw: float
+    queries: int
+    budget: int | None
+    time_sec: float
+
+    history: list[float] = field(default_factory=list)
+    params: dict[str, Any] = field(default_factory=dict)
+    extra: dict[str, Any] = field(default_factory=dict)
+    x_best: np.ndarray | None = field(default=None, repr=False, compare=False)
+
+    def to_dict(self) -> dict[str, Any]:
+        row = asdict(self)
+        row.pop("x_best", None)
+        return row
+
+
+def _get_hash_id(hash_fn: Any) -> str:
+    return str(getattr(getattr(hash_fn, "spec", None), "hash_id", "hash"))
+
+
+def _get_threshold(hash_fn: Any) -> float:
+    return float(getattr(getattr(hash_fn, "spec", None), "threshold_p"))
+
+
+def _resolve_attack(attack: Any) -> tuple[str, Any, dict[str, Any]]:
+    """Return (attack_id, run_attack_fn, default_params)."""
+    if isinstance(attack, RegisteredAttack):
+        return attack.attack_id, attack.run_attack, dict(attack.default_params)
+
+    if hasattr(attack, "run_attack"):
+        attack_id = getattr(attack, "ATTACK_ID", None) or getattr(attack, "attack_id", None)
+        return str(attack_id or getattr(attack, "__name__", "attack").split(".")[-1]), attack.run_attack, dict(getattr(attack, "DEFAULT_PARAMS", {}))
+
+    if callable(attack):
+        return getattr(attack, "__name__", "attack"), attack, {}
+
+    raise TypeError("attack must be a RegisteredAttack, module with run_attack, or callable")
+
+
+def evaluate_attack(
+    *,
+    attack: Any,
+    hash_fn: Any,
+    x_source: np.ndarray,
+    x_target: np.ndarray,
+    params: Optional[dict[str, Any]] = None,
+    budget: int | BudgetSpec | None = 10_000,
+    seed: int = 0,
+    pair_id: str | None = None,
+    attack_id: str | None = None,
+    constraints: ConstraintSpec | None = None,
+    resize_size: int | None = None,
+    resize_resample: str = "bilinear",
+) -> EvalRow:
+    """Run one attack on one pair and recompute all final metrics."""
+    x0_original = to_float32(x_source)
+    y_original = to_float32(x_target)
+
+    resolved_attack_id, run_attack, default_params = _resolve_attack(attack)
+    resolved_attack_id = attack_id or resolved_attack_id
+    full_params = {**default_params, **(params or {})}
+    if resize_size is None and "resize_size" in full_params:
+        resize_size = int(full_params.pop("resize_size"))
+
+    resize_spec = ResizeSpec(size=resize_size, resample=resize_resample)
+    x0 = apply_resize(x0_original, resize_spec)
+    y = apply_resize(y_original, resize_spec)
+
+    if budget is None:
+        budget_spec = BudgetSpec(max_queries=None, seed=seed)
+    elif isinstance(budget, int):
+        budget_spec = BudgetSpec(max_queries=int(budget), seed=seed)
+    else:
+        budget_spec = budget
+        if getattr(budget_spec, "seed", seed) != seed:
+            budget_spec = BudgetSpec(
+                max_queries=budget_spec.max_queries,
+                max_time_s=budget_spec.max_time_s,
+                seed=seed,
+            )
+
+    target_hash = hash_fn.compute(y)
+    source_hash = hash_fn.compute(x0)
+    initial_hash_l1 = float(hash_fn.distance(source_hash, target_hash))
+    threshold = _get_threshold(hash_fn)
+
+    oracle = HashOracle(
+        hash_fn=hash_fn,
+        target_hash=target_hash,
+        x_source=x0,
+        budget=budget_spec,
+        constraints=constraints,
+    )
+
+    t0 = time.perf_counter()
+    raw: AttackRawResult = run_attack(
+        x_source=x0,
+        oracle=oracle,
+        params=full_params,
+        budget=budget_spec.max_queries,
+        seed=seed,
+    )
+    time_sec = float(time.perf_counter() - t0)
+
+    # Evaluator never trusts attack metrics. Recompute from x_best.
+    x_best = to_float32(raw.x_best)
+    final_hash_l1 = float(hash_fn.distance(hash_fn.compute(x_best), target_hash))
+    best_hash_l1 = float(min([initial_hash_l1, final_hash_l1, oracle.best_hash_l1]))
+
+    pixel_l2 = compute_pixel_l2(x0, x_best)
+    pixel_l2_raw = compute_pixel_l2_raw(x0, x_best)
+    success = bool(final_hash_l1 <= threshold)
+    improved = bool(final_hash_l1 < initial_hash_l1)
+    relative_improvement = compute_relative_improvement(
+        initial_hash_l1=initial_hash_l1,
+        final_hash_l1=final_hash_l1,
+        threshold=threshold,
+    )
+
+    history = list(raw.history or oracle.state.best_history)
+
+    return EvalRow(
+        pair_id=pair_id,
+        hash_id=_get_hash_id(hash_fn),
+        attack_id=resolved_attack_id,
+        seed=int(seed),
+        initial_hash_l1=float(initial_hash_l1),
+        final_hash_l1=float(final_hash_l1),
+        best_hash_l1=float(best_hash_l1),
+        threshold=float(threshold),
+        success=success,
+        improved=improved,
+        relative_improvement=float(relative_improvement),
+        pixel_l2=float(pixel_l2),
+        pixel_l2_raw=float(pixel_l2_raw),
+        queries=int(oracle.queries),
+        budget=budget_spec.max_queries,
+        time_sec=time_sec,
+        history=history,
+        params=dict(raw.params or full_params),
+        extra={
+            "original_shape": tuple(int(v) for v in x0_original.shape),
+            "eval_shape": tuple(int(v) for v in x0.shape),
+            "resize_size": resize_size,
+            "resize_resample": resize_resample if resize_size is not None else None,
+            "oracle_stopped_reason": oracle.state.stopped_reason,
+            **(raw.extra or {}),
+        },
+        x_best=x_best,
+    )
+
+
+def evaluate_dataset(
+    *,
+    dataset: Iterable[Any],
+    hash_fn: Any,
+    attack: Any,
+    params: Optional[dict[str, Any]] = None,
+    budget: int = 10_000,
+    seed: int = 0,
+    max_pairs: Optional[int] = None,
+    resize_size: int | None = None,
+    resize_resample: str = "bilinear",
+) -> list[EvalRow]:
+    rows: list[EvalRow] = []
+    for i, sample in enumerate(dataset):
+        if max_pairs is not None and i >= max_pairs:
+            break
+        rows.append(
+            evaluate_attack(
+                attack=attack,
+                hash_fn=hash_fn,
+                x_source=sample.x,
+                x_target=sample.y,
+                params=params,
+                budget=budget,
+                seed=seed,
+                pair_id=getattr(sample, "pair_id", str(i)),
+                resize_size=resize_size,
+                resize_resample=resize_resample,
+            )
+        )
+    return rows
+
+
+# Backwards-compatible light wrapper for older notebooks.
+def run_eval_on_ds(
+    dataset: Iterable[Any],
+    evaluator: Any | None = None,
+    *,
+    hash_fn: Any | None = None,
+    attack: Any | None = None,
+    params: Optional[dict[str, Any]] = None,
+    budget: int = 10_000,
+    seed: int = 0,
+    max_pairs: Optional[int] = None,
+    resize_size: int | None = None,
+    resize_resample: str = "bilinear",
+    **_: Any,
+) -> list[EvalRow]:
+    if hash_fn is None or attack is None:
+        raise ValueError("run_eval_on_ds now expects hash_fn=... and attack=...")
+    return evaluate_dataset(
+        dataset=dataset,
+        hash_fn=hash_fn,
+        attack=attack,
+        params=params,
+        budget=budget,
+        seed=seed,
+        max_pairs=max_pairs,
+        resize_size=resize_size,
+        resize_resample=resize_resample,
+    )
 
 
 class Evaluator:
-    def __init__(
-        self,
-        hash_registry: HashRegistry,
-        attack_registry: AttackRegistry,
-        img_distance_fn: Callable[[np.ndarray, np.ndarray], float] = l2_img,
-    ) -> None:
+    """Small compatibility facade around evaluate_attack().
+
+    New code can call evaluate_attack(...) directly. This class exists so old
+    imports from evohash.__init__ do not break.
+    """
+
+    def __init__(self, hash_registry: Any | None = None, attack_registry: Any | None = None) -> None:
         self.hash_registry = hash_registry
         self.attack_registry = attack_registry
-        self._img_dist = img_distance_fn
 
     def evaluate(
         self,
-        sample: PairSample,
+        sample: Any,
         hash_id: str,
-        attack_id: str,
-        budget: BudgetSpec,
-        constraints: ConstraintSpec = ConstraintSpec(),
+        attack_id: str = "nes",
+        budget: int | BudgetSpec | None = 10_000,
+        constraints: ConstraintSpec | None = None,
+        params: Optional[dict[str, Any]] = None,
+        seed: int = 0,
+        resize_size: int | None = None,
+        resize_resample: str = "bilinear",
     ) -> EvalRow:
+        if self.hash_registry is None or self.attack_registry is None:
+            raise ValueError("Evaluator requires hash_registry and attack_registry")
         hash_fn = self.hash_registry.get(hash_id)
         attack = self.attack_registry.get(attack_id)
-
-        x0 = to_float32(sample.x)
-        y = to_float32(sample.y)
-        target_digest = hash_fn.compute(y)
-
-        oracle = HashOracle(
+        return evaluate_attack(
+            attack=attack,
             hash_fn=hash_fn,
-            target_digest=target_digest,
-            x0=x0,
+            x_source=sample.x,
+            x_target=sample.y,
+            params=params,
             budget=budget,
+            seed=seed,
+            pair_id=getattr(sample, "pair_id", None),
             constraints=constraints,
-            img_distance_fn=self._img_dist,
+            resize_size=resize_size,
+            resize_resample=resize_resample,
         )
-
-        res = attack.run(x0, oracle, budget)
-
-        # Independent re-evaluation — never trust attack's self-reported score
-        x_best = to_float32(res.x_best)
-        d_hash = float(hash_fn.distance(hash_fn.compute(x_best), target_digest))
-        d_img = float(self._img_dist(x_best, x0))
-
-        constraints_ok = (
-            constraints.max_l2 is None or d_img <= constraints.max_l2
-        )
-        success = (d_hash <= hash_fn.spec.threshold_p) and constraints_ok
-
-        return EvalRow(
-            pair_id=sample.pair_id,
-            hash_id=hash_id,
-            attack_id=attack_id,
-            seed=budget.seed,
-            success=bool(success),
-            d_hash=d_hash,
-            d_img=d_img,
-            queries_used=res.queries_used,
-            runtime_ms=res.runtime_ms,
-            stopped_reason=res.stopped_reason,
-            extra={"constraints_ok": constraints_ok, **(res.extra or {})},
-        )
-
-
-def run_eval_on_ds(
-    dataset: Dataset,
-    evaluator: Evaluator,
-    *,
-    hash_ids: Optional[List[str]] = None,
-    attack_ids: Optional[List[str]] = None,
-    seeds: List[int] = [0],
-    max_queries: int = 200,
-    max_time_ms: int = 5_000,
-    max_l2: Optional[float] = None,
-    verbose: bool = True,
-) -> List[EvalRow]:
-    """Run all (hash, attack, seed) combinations over the dataset.
-
-    Args:
-        dataset:     Dataset to iterate over.
-        evaluator:   Evaluator instance with registered hashes and attacks.
-        hash_ids:    Hash IDs to evaluate (default: all registered).
-        attack_ids:  Attack IDs to evaluate (default: all registered).
-        seeds:       RNG seeds for repeated trials.
-        max_queries: Query budget per trial.
-        max_time_ms: Time budget per trial (ms).
-        max_l2:      Optional pixel L2 constraint.
-        verbose:     Print progress.
-
-    Returns:
-        List of EvalRow, one per (sample, hash, attack, seed) combination.
-    """
-    if hash_ids is None:
-        hash_ids = evaluator.hash_registry.list_ids()
-    if attack_ids is None:
-        attack_ids = evaluator.attack_registry.list_ids()
-
-    constraints = ConstraintSpec(max_l2=max_l2)
-    rows: List[EvalRow] = []
-    total = 0
-
-    for sample in dataset:
-        for hid in hash_ids:
-            for aid in attack_ids:
-                for seed in seeds:
-                    budget = BudgetSpec(
-                        max_queries=max_queries,
-                        max_time_ms=max_time_ms,
-                        seed=seed,
-                    )
-                    row = evaluator.evaluate(
-                        sample=sample,
-                        hash_id=hid,
-                        attack_id=aid,
-                        budget=budget,
-                        constraints=constraints,
-                    )
-                    rows.append(row)
-                    total += 1
-                    if verbose and total % 10 == 0:
-                        print(
-                            f"  [{total}] {sample.pair_id} | {hid} | {aid} "
-                            f"| success={row.success} "
-                            f"d_hash={row.d_hash:.1f} "
-                            f"d_img={row.d_img:.4f} "
-                            f"q={row.queries_used}"
-                        )
-
-    return rows
