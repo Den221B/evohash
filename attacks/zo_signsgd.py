@@ -12,6 +12,8 @@ from evohash.oracle import BudgetSpec, HashOracle
 ATTACK_ID = "zo_signsgd"
 
 DEFAULT_PARAMS: dict[str, Any] = {
+    "estimator": "central",
+    "direction_dist": "gaussian",
     "q": 16,
     "mu": 16.0 / 255.0,
     "lr": 12.0 / 255.0,
@@ -20,17 +22,21 @@ DEFAULT_PARAMS: dict[str, Any] = {
 }
 
 
-def _sample_gaussian_direction(
+def _sample_direction(
     shape: tuple[int, ...],
     rng: np.random.Generator,
     *,
-    normalize_probe_rms: bool = True,
+    distribution: str = "gaussian",
 ) -> np.ndarray:
     direction = rng.standard_normal(shape).astype(np.float32)
-    if normalize_probe_rms:
-        rms = float(np.sqrt(np.mean(direction ** 2)))
-        if rms > 0.0:
-            direction /= rms
+    if distribution == "sphere":
+        norm = float(np.linalg.norm(direction.ravel()))
+        if norm > 0.0:
+            direction /= norm
+    elif distribution == "gaussian":
+        pass
+    else:
+        raise ValueError("direction_dist must be 'gaussian' or 'sphere'")
     return direction
 
 
@@ -42,6 +48,8 @@ def run_attack(
     seed: int = 0,
 ) -> AttackRawResult:
     cfg = {**DEFAULT_PARAMS, **(params or {})}
+    estimator = str(cfg.get("estimator", "central"))
+    direction_dist = str(cfg.get("direction_dist", "gaussian"))
     q = int(cfg.get("q", 16))
     mu = float(cfg.get("mu", 16.0 / 255.0))
     lr = float(cfg.get("lr", 12.0 / 255.0))
@@ -61,6 +69,7 @@ def run_attack(
     history = [best_dist]
     history_rows: list[dict[str, Any]] = []
     iters_done = 0
+    dim = int(np.prod(current.shape))
 
     for iters_done in range(1, max_iters + 1):
         if best_dist <= oracle.threshold or not oracle.budget_ok():
@@ -68,21 +77,49 @@ def run_attack(
 
         grad = np.zeros_like(current, dtype=np.float32)
         used = 0
-        for _ in range(q):
+
+        if estimator in {"forward", "majority"}:
             if not oracle.budget_ok():
                 break
+            f_x = float(oracle.query(current))
+            for _ in range(q):
+                if not oracle.budget_ok():
+                    break
 
-            direction = _sample_gaussian_direction(current.shape, rng, normalize_probe_rms=True)
-            x_plus = np.clip(current + mu * direction, 0.0, 1.0)
-            f_plus = float(oracle.query(x_plus))
+                direction = _sample_direction(current.shape, rng, distribution=direction_dist)
+                x_plus = np.clip(current + mu * direction, 0.0, 1.0)
+                f_plus = float(oracle.query(x_plus))
+                indiv = ((f_plus - f_x) / max(mu, 1e-12)) * direction
+                if direction_dist == "sphere":
+                    indiv *= dim
+                if estimator == "majority":
+                    grad += np.sign(indiv)
+                else:
+                    grad += indiv
+                used += 1
 
-            if not oracle.budget_ok():
-                break
+        elif estimator == "central":
+            for _ in range(q):
+                if not oracle.budget_ok():
+                    break
 
-            x_minus = np.clip(current - mu * direction, 0.0, 1.0)
-            f_minus = float(oracle.query(x_minus))
-            grad += ((f_plus - f_minus) / max(2.0 * mu, 1e-12)) * direction
-            used += 1
+                direction = _sample_direction(current.shape, rng, distribution=direction_dist)
+                x_plus = np.clip(current + mu * direction, 0.0, 1.0)
+                f_plus = float(oracle.query(x_plus))
+
+                if not oracle.budget_ok():
+                    break
+
+                x_minus = np.clip(current - mu * direction, 0.0, 1.0)
+                f_minus = float(oracle.query(x_minus))
+                indiv = ((f_plus - f_minus) / max(2.0 * mu, 1e-12)) * direction
+                if direction_dist == "sphere":
+                    indiv *= dim
+                grad += indiv
+                used += 1
+
+        else:
+            raise ValueError("estimator must be 'forward', 'central', or 'majority'")
 
         if used == 0:
             break
@@ -104,6 +141,8 @@ def run_attack(
                 "queries": int(oracle.queries),
                 "best_hash_l1": best_dist,
                 "hash_l1": float(current_dist),
+                "estimator": estimator,
+                "direction_dist": direction_dist,
             })
 
     return AttackRawResult(
