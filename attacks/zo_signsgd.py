@@ -34,7 +34,7 @@ def _sample_direction(
         if norm > 0.0:
             direction /= norm
     elif distribution == "gaussian":
-        pass
+        pass # Useless
     else:
         raise ValueError("direction_dist must be 'gaussian' or 'sphere'")
     return direction

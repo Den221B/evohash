@@ -18,7 +18,7 @@
   "note": "Resize and runtime budget are infrastructure-level settings. Attack configs contain only algorithm hyperparameters; use defaults.budget unless an explicit caller override is needed.",
   "defaults": {
     "seed": 0,
-    "budget": 20000
+    "budget": 10000
   },
   "configs": {
     "pdq": {
@@ -32,11 +32,11 @@
       "prokos": {
         "profile": "clean_ema_one_sided",
         "max_iters": 300,
-        "n_samples": 20,
-        "sigma": 0.5,
-        "lr": 10.0,
+        "n_samples": 80,
+        "sigma": 0.337847,
+        "lr": 38.0413,
         "momentum": 0.5,
-        "antithetic": false,
+        "antithetic": true,
         "grayscale_noise": true
       },
       "nes_attack_v0": {
@@ -66,12 +66,12 @@
         "order": "strided",
         "freq_dims": 10,
         "stride": 1,
-        "epsilon": 7.450980392156863,
+        "epsilon":  30,
         "max_iters": 9999,
         "source_units_note": "Notebook value epsilon=1900 in [0,255], converted exactly by /255. Do not round to 8: PDQ SimBA is path-sensitive."
       },
       "zo_signsgd": {
-        "profile": "working_central_gaussian_pdq_256",
+        "profile": "paper_style_zo_signsgd_pdq_256",
         "estimator": "central",
         "direction_dist": "gaussian",
         "q": 16,
@@ -79,21 +79,57 @@
         "lr": 0.047058823529411764,
         "max_iters": 300,
         "eval_updated_point": true,
-        "source_units_note": "Notebook values mu=16, lr=12 in [0,255], converted by /255."
+        "source_units_note": "PDQ working values mu=16, lr=12 in [0,255], converted by /255. Optimizer may choose estimator=forward/central/majority; sphere direction is implemented but not searched by default."
       }
     },
     "phash": {
       "atkscopes": {
-        "profile": "working_global_dct_phash_fast",
         "scale": "global",
-        "max_iters": 4000,
         "a": 10.0,
         "lr": 3.0,
         "max_freq": 8,
         "beta1": 0.9,
         "beta2": 0.999,
         "eps": 1e-08,
-        "log_every": 10
+        "max_iters": 4000
+      },
+      "nes": {
+        "sigma": 2.05614,
+        "lr": 0.365293,
+        "n_samples": 10,
+        "max_iters": 500
+      },
+      "nes_attack_v0": {
+        "sigma": 1.22485,
+        "lr": 62.4215,
+        "n_samples": 40,
+        "momentum": 0.362809,
+        "grayscale_noise": true,
+        "max_iters": 500
+      },
+      "prokos": {
+        "sigma": 0.796176,
+        "lr": 68.843,
+        "n_samples": 40,
+        "momentum": 0.458142,
+        "antithetic": true,
+        "grayscale_noise": true,
+        "max_iters": 500
+      },
+      "simba": {
+        "freq_dims": 1,
+        "epsilon": 128.552,
+        "stride": 4,
+        "max_iters": 10000
+      },
+      "zo_signsgd": {
+        "estimator": "majority",
+        "direction_dist": "gaussian",
+        "q": 8,
+        "mu": 0.132892,
+        "lr": 0.153814,
+        "eval_updated_point": true,
+        "max_iters": 606
       }
     },
     "neuralhash": {
@@ -112,17 +148,52 @@
     },
     "photodna": {
       "atkscopes": {
-        "profile": "validated_mid_dct_photodna_fast_pair0",
         "scale": "mid",
-        "max_iters": 8000,
-        "a": 15.0,
-        "lr": 5.0,
-        "patch_size": 64,
-        "max_freq": 8,
+        "a": 6.2764,
+        "lr": 5.05876,
+        "patch_size": 128,
+        "max_freq": 12,
         "beta1": 0.9,
         "beta2": 0.999,
-        "eps": 1e-08,
-        "log_every": 100
+        "max_iters": 8000
+      },
+      "nes": {
+        "sigma": 0.802123,
+        "lr": 0.00160683,
+        "n_samples": 20,
+        "max_iters": 1000
+      },
+      "nes_attack_v0": {
+        "sigma": 0.215094,
+        "lr": 35.834,
+        "n_samples": 40,
+        "momentum": 0.74104,
+        "grayscale_noise": true,
+        "max_iters": 1000
+      },
+      "prokos": {
+        "sigma": 0.420121,
+        "lr": 17.2725,
+        "n_samples": 40,
+        "momentum": 0.660901,
+        "antithetic": true,
+        "grayscale_noise": true,
+        "max_iters": 1000
+      },
+      "simba": {
+        "freq_dims": 8,
+        "epsilon": 18.1709,
+        "stride": 1,
+        "max_iters": 10000
+      },
+      "zo_signsgd": {
+        "estimator": "majority",
+        "direction_dist": "gaussian",
+        "q": 64,
+        "mu": 0.0128307,
+        "lr": 0.100121,
+        "eval_updated_point": true,
+        "max_iters": 606
       }
     }
   },
@@ -131,6 +202,8 @@
     "resize_resample": "bilinear"
   },
   "thresholds": {
-    "pdq": 92.0
+    "pdq": 92.0,
+    "phash": 12.0,
+    "photodna": 3855.0
   }
 }
