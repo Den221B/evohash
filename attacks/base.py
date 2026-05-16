@@ -14,6 +14,7 @@ implementations/classes.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import math
 from typing import Any, Callable, Dict, Iterable, Optional
 
 import numpy as np
@@ -76,3 +77,24 @@ class AttackRegistry:
 
     def items(self) -> Iterable[tuple[str, RegisteredAttack]]:
         return self._reg.items()
+
+
+def resolve_max_iters(
+    params: dict[str, Any],
+    *,
+    budget: int | Any | None,
+    queries_per_iter: float,
+    default_unlimited: int = 100_000,
+) -> int:
+    """Resolve the technical iteration cap from budget unless explicit."""
+    if "max_iters" in params:
+        return int(params["max_iters"])
+    if "n_iter" in params:
+        return int(params["n_iter"])
+
+    max_queries = getattr(budget, "max_queries", budget)
+    if max_queries is None:
+        return int(default_unlimited)
+
+    qpi = max(float(queries_per_iter), 1.0)
+    return max(1, int(math.ceil(float(max_queries) / qpi)) + 2)

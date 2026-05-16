@@ -5,7 +5,7 @@ from typing import Any, Optional
 
 import numpy as np
 
-from evohash.attacks.base import AttackRawResult
+from evohash.attacks.base import AttackRawResult, resolve_max_iters
 from evohash.metrics import compute_pixel_l2, to_float32
 from evohash.oracle import BudgetSpec, HashOracle
 
@@ -17,7 +17,6 @@ DEFAULT_PARAMS: dict[str, Any] = {
     "q": 16,
     "mu": 16.0 / 255.0,
     "lr": 12.0 / 255.0,
-    "max_iters": 606,
     "eval_updated_point": True,
 }
 
@@ -53,9 +52,13 @@ def run_attack(
     q = int(cfg.get("q", 16))
     mu = float(cfg.get("mu", 16.0 / 255.0))
     lr = float(cfg.get("lr", 12.0 / 255.0))
-    max_iters = int(cfg.get("max_iters", cfg.get("n_iter", 606)))
     eval_updated_point = bool(cfg.get("eval_updated_point", True))
     log_every = int(cfg.get("log_every", 0))
+    if estimator == "central":
+        queries_per_iter = 2 * q + int(eval_updated_point)
+    else:
+        queries_per_iter = q + 1 + int(eval_updated_point)
+    max_iters = resolve_max_iters(cfg, budget=budget, queries_per_iter=queries_per_iter)
 
     rng = np.random.default_rng(int(cfg.get("seed", seed)))
     current = to_float32(x_source).astype(np.float32)

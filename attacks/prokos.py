@@ -5,14 +5,13 @@ from typing import Any, Optional
 
 import numpy as np
 
-from evohash.attacks.base import AttackRawResult
+from evohash.attacks.base import AttackRawResult, resolve_max_iters
 from evohash.metrics import compute_pixel_l2, to_float32
 from evohash.oracle import BudgetSpec, HashOracle
 
 ATTACK_ID = "prokos"
 
 DEFAULT_PARAMS: dict[str, Any] = {
-    "max_iters": 300,
     "n_samples": 20,
     "sigma": 0.5,
     "lr": 10.0,
@@ -41,13 +40,14 @@ def run_attack(
     seed: int = 0,
 ) -> AttackRawResult:
     cfg = {**DEFAULT_PARAMS, **(params or {})}
-    max_iters = int(cfg.get("max_iters", cfg.get("n_iter", 300)))
     n_samples = int(cfg.get("n_samples", 20))
     sigma = float(cfg.get("sigma", 0.5))
     lr = float(cfg.get("lr", 10.0))
     momentum = float(cfg.get("momentum", 0.5))
     antithetic = bool(cfg.get("antithetic", False))
     grayscale_noise = bool(cfg.get("grayscale_noise", cfg.get("grayscale", True)))
+    queries_per_iter = (2 * n_samples + 1) if antithetic else (n_samples + 2)
+    max_iters = resolve_max_iters(cfg, budget=budget, queries_per_iter=queries_per_iter)
 
     rng = np.random.default_rng(int(cfg.get("seed", seed)))
     sample_dir = _grayscale_gaussian_direction if grayscale_noise else _gaussian_direction

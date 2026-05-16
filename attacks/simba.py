@@ -5,7 +5,7 @@ from typing import Any, Optional
 
 import numpy as np
 
-from evohash.attacks.base import AttackRawResult
+from evohash.attacks.base import AttackRawResult, resolve_max_iters
 from evohash.metrics import compute_pixel_l2, to_float32
 from evohash.oracle import BudgetSpec, HashOracle
 
@@ -17,7 +17,6 @@ DEFAULT_PARAMS: dict[str, Any] = {
     "freq_dims": 10,
     "stride": 1,
     "epsilon": 1900.0 / 255.0,
-    "max_iters": 9999,
 }
 
 _DCT_BASIS_CACHE: dict[tuple[int, int, int, int], np.ndarray] = {}
@@ -128,7 +127,7 @@ def run_attack(
     freq_dims = int(cfg.get("freq_dims", 10))
     stride = int(cfg.get("stride", 1))
     epsilon = float(cfg.get("epsilon", 1900.0 / 255.0))
-    max_iters = int(cfg.get("max_iters", cfg.get("n_iter", 9999)))
+    max_iters = resolve_max_iters(cfg, budget=budget, queries_per_iter=1)
     log_every = int(cfg.get("log_every", 0))
 
     x0 = to_float32(x_source).astype(np.float32)

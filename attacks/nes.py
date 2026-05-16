@@ -5,14 +5,13 @@ from typing import Any, Optional
 
 import numpy as np
 
-from evohash.attacks.base import AttackRawResult
+from evohash.attacks.base import AttackRawResult, resolve_max_iters
 from evohash.metrics import compute_pixel_l2, to_float32
 from evohash.oracle import BudgetSpec, HashOracle
 
 ATTACK_ID = "nes"
 
 DEFAULT_PARAMS: dict[str, Any] = {
-    "max_iters": 300,
     "n_samples": 20,
     "sigma": 0.5,
     "lr": 0.01,
@@ -31,10 +30,10 @@ def run_attack(
     seed: int = 0,
 ) -> AttackRawResult:
     cfg = {**DEFAULT_PARAMS, **(params or {})}
-    max_iters = int(cfg.get("max_iters", cfg.get("n_iter", 300)))
     n_samples = int(cfg.get("n_samples", 20))
     sigma = float(cfg.get("sigma", 0.5))
     lr = float(cfg.get("lr", 0.01))
+    max_iters = resolve_max_iters(cfg, budget=budget, queries_per_iter=2 * n_samples + 1)
 
     rng = np.random.default_rng(int(cfg.get("seed", seed)))
     x = to_float32(x_source).astype(np.float32).copy()

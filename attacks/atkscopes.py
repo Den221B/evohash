@@ -7,7 +7,7 @@ from typing import Any, Optional
 import numpy as np
 from scipy.fft import dct, idct
 
-from evohash.attacks.base import AttackRawResult
+from evohash.attacks.base import AttackRawResult, resolve_max_iters
 from evohash.metrics import compute_pixel_l2, to_float32
 from evohash.oracle import BudgetSpec, HashOracle
 
@@ -15,7 +15,6 @@ ATTACK_ID = "atkscopes"
 
 DEFAULT_PARAMS: dict[str, Any] = {
     "scale": "global",
-    "max_iters": 4000,
     "a": 1.5,
     "lr": 1.0,
     "max_freq": 16,
@@ -225,7 +224,6 @@ def run_attack(
 ) -> AttackRawResult:
     cfg = {**DEFAULT_PARAMS, **(params or {})}
     scale = str(cfg.get("scale", "global"))
-    max_iters = int(cfg.get("max_iters", cfg.get("n_iter", 4000)))
     a = float(cfg.get("a", 1.5))
     lr = float(cfg.get("lr", 1.0))
     max_freq = int(cfg.get("max_freq", 16))
@@ -235,6 +233,7 @@ def run_attack(
     beta2 = float(cfg.get("beta2", 0.999))
     eps = float(cfg.get("eps", 1e-8))
     log_every = int(cfg.get("log_every", 50))
+    max_iters = resolve_max_iters(cfg, budget=budget, queries_per_iter=1)
 
     rng = np.random.default_rng(int(cfg.get("seed", seed)))
     x0 = to_float32(x_source).astype(np.float32)
