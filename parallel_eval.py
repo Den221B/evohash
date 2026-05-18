@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import multiprocessing as mp
 import os
+import signal
 import threading
 import traceback
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
@@ -154,18 +155,46 @@ class EvalJobRunner:
         executor = self._ensure_executor(len(job_list))
         rows: list[dict[str, Any]] = []
         futures = [executor.submit(_run_one_job, job) for job in job_list]
-        iterator = as_completed(futures)
-        for future in _maybe_progress(iterator, self.show_progress, self.backend, total=len(futures)):
-            rows.append(future.result())
+        try:
+            iterator = as_completed(futures)
+            for future in _maybe_progress(iterator, self.show_progress, self.backend, total=len(futures)):
+                rows.append(future.result())
+        except KeyboardInterrupt:
+            for future in futures:
+                future.cancel()
+            self._shutdown_executor(wait=False, cancel_futures=True, terminate_processes=True)
+            raise
         return sorted(rows, key=lambda row: int(row["job_index"]))
 
     def close(self) -> None:
+        self._shutdown_executor(wait=True, cancel_futures=False, terminate_processes=False)
+
+    def _shutdown_executor(
+        self,
+        *,
+        wait: bool,
+        cancel_futures: bool,
+        terminate_processes: bool,
+    ) -> None:
         if self._executor is not None:
+            executor = self._executor
+            if terminate_processes:
+                self._terminate_executor_processes(executor)
             try:
-                self._executor.shutdown(wait=True, cancel_futures=False)
+                executor.shutdown(wait=wait, cancel_futures=cancel_futures)
             except TypeError:
-                self._executor.shutdown(wait=True)
+                executor.shutdown(wait=wait)
             self._executor = None
+
+    def _terminate_executor_processes(self, executor: Executor) -> None:
+        if self.backend != "process":
+            return
+        processes = getattr(executor, "_processes", None)
+        if not processes:
+            return
+        for process in list(processes.values()):
+            if process.is_alive():
+                process.terminate()
 
     def _ensure_executor(self, n_jobs: int) -> Executor:
         if self._executor is not None:
@@ -188,7 +217,7 @@ class EvalJobRunner:
                 executor_kwargs["mp_context"] = mp.get_context(self.process_start_method)
             self._executor = ProcessPoolExecutor(
                 max_workers=max_workers,
-                initializer=_init_worker,
+                initializer=_init_process_worker,
                 initargs=(self.context,),
                 **executor_kwargs,
             )
@@ -202,6 +231,14 @@ class EvalJobRunner:
 
     def __exit__(self, exc_type, exc, tb) -> None:
         self.close()
+
+
+def _init_process_worker(context: dict[str, Any]) -> None:
+    try:
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+    except (AttributeError, ValueError):
+        pass
+    _init_worker(context)
 
 
 def _init_worker(context: dict[str, Any]) -> None:

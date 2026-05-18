@@ -826,6 +826,7 @@ def run_optuna(
     enqueue_base: bool = True,
 ):
     import optuna
+    from optuna.trial import TrialState
 
     base = base_params or attack_params_from_config(config, settings.hash_id, settings.attack_id)
     sampler = optuna.samplers.TPESampler(seed=settings.seed, multivariate=True, group=True)
@@ -838,11 +839,17 @@ def run_optuna(
         storage=storage,
         load_if_exists=bool(storage and study_name),
     )
-    if enqueue_base and not study.trials:
+    existing_trials = len(study.trials)
+    if enqueue_base and not existing_trials:
         study.enqueue_trial(_search_space_projection(settings.attack_id, base))
     objective = objective_factory(pairs=pairs, config=config, settings=settings, base_params=base)
+    remaining_trials = int(n_trials)
+    if storage and study_name and existing_trials:
+        completed_trials = sum(1 for trial in study.trials if trial.state == TrialState.COMPLETE)
+        remaining_trials = max(0, int(n_trials) - int(completed_trials))
     try:
-        study.optimize(objective, n_trials=n_trials)
+        if remaining_trials > 0:
+            study.optimize(objective, n_trials=remaining_trials)
     finally:
         close = getattr(objective, "close", None)
         if callable(close):
