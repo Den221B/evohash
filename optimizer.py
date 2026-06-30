@@ -19,19 +19,8 @@ import numpy as np
 from evohash.attacks import build_attack_registry
 from evohash.dataset import Dataset, PairSample
 from evohash.evaluator import EvalRow, evaluate_attack
-from evohash.hashes.neuralhash import NeuralHashWrapper
-from evohash.hashes.pdq import PDQWrapper
-from evohash.hashes.phash import PHashWrapper
-from evohash.hashes.photodna import PhotoDNAWrapper
-
-
-META_PARAM_KEYS = {
-    "profile",
-    "source_units_note",
-    "max_iters",
-    "n_iter",
-    "log_every",
-}
+from evohash.hashes import build_hash_fn
+from evohash.parallel_eval import META_PARAM_KEYS, clean_public_params
 
 RUNTIME_PARAM_KEYS = {
     "max_iters",
@@ -96,6 +85,7 @@ class OptimizerSettings:
     parallel_min_pairs: int = 2
     parallel_process_start_method: str | None = None
     parallel_show_progress: bool = False
+    compute_lpips: bool = False
 
 
 @dataclass
@@ -116,6 +106,7 @@ class CandidateSummary:
     mean_final_hash_l1: float
     mean_best_hash_l1: float
     mean_gap_to_threshold: float
+    mean_lpips: float = float("nan")
     params: dict[str, Any] = field(default_factory=dict)
     rows: list[dict[str, Any]] = field(default_factory=list)
 
@@ -157,35 +148,14 @@ def attack_params_from_config(config: dict[str, Any], hash_id: str, attack_id: s
     return clean_public_params(params)
 
 
-def clean_public_params(params: dict[str, Any]) -> dict[str, Any]:
-    """Drop metadata and runtime-only knobs from a persisted attack config."""
-    clean = dict(params)
-    for key in META_PARAM_KEYS | RUNTIME_PARAM_KEYS:
-        clean.pop(key, None)
-    return clean
+# clean_public_params and build_hash_fn live in their canonical modules:
+#   clean_public_params → evohash.parallel_eval  (imported above)
+#   build_hash_fn       → evohash.hashes          (imported above)
+# Both are re-exported here so existing callsites keep working without change.
 
 
 def load_pairs(zip_path: str | Path, *, split: str = "public", n_pairs: int | None = 3) -> list[PairSample]:
     return list(Dataset(str(zip_path), split=split, max_pairs=n_pairs))
-
-
-def build_hash_fn(hash_id: str, config: dict[str, Any]):
-    """Build hash wrapper for optimizer targets."""
-    thresholds = config.get("thresholds", {})
-
-    if hash_id == "pdq":
-        return PDQWrapper(threshold_p=float(thresholds.get("pdq", 92.0)))
-    if hash_id == "phash":
-        return PHashWrapper(threshold_p=float(thresholds.get("phash", 12.0)))
-    if hash_id == "neuralhash":
-        return NeuralHashWrapper(threshold_p=float(thresholds.get("neuralhash", 17.0)))
-    if hash_id == "photodna":
-        dll_path = Path(__file__).resolve().parent / "hashes" / "dll" / "PhotoDNAx64.dll"
-        kwargs: dict[str, Any] = {"threshold_p": float(thresholds.get("photodna", 3855.0))}
-        if dll_path.exists():
-            kwargs["dll_path"] = str(dll_path)
-        return PhotoDNAWrapper(**kwargs)
-    raise ValueError(f"Unknown hash_id for optimizer hash factory: {hash_id!r}")
 
 
 def resolve_parallel_runtime(settings: OptimizerSettings, n_pairs: int) -> ParallelRuntime:
@@ -227,7 +197,8 @@ def _auto_parallel_backend(hash_id: str) -> str:
         return "process" if os.name == "posix" else "thread"
     if hash_id == "photodna":
         return "process"
-    # NeuralHash can have GPU/provider-specific behavior; keep it explicit for now.
+    if hash_id == "neuralhash":
+        return "process"
     return "sequential"
 
 
@@ -244,7 +215,28 @@ def _resolve_parallel_workers(settings: OptimizerSettings, *, n_pairs: int, back
     workers = min(max(1, workers), pair_cap, cpu_cap)
     if settings.hash_id == "photodna" and backend == "process":
         workers = min(workers, _photodna_process_worker_cap(settings, n_pairs=pair_cap, cpu_count=cpu_cap))
+    if settings.hash_id == "neuralhash" and backend == "process":
+        workers = min(workers, _neuralhash_process_worker_cap(settings, n_pairs=pair_cap, cpu_count=cpu_cap))
     return max(1, int(workers))
+
+
+def _neuralhash_process_worker_cap(
+    settings: OptimizerSettings,
+    *,
+    n_pairs: int,
+    cpu_count: int,
+) -> int:
+    env_cap = _env_int("EVOHASH_NEURALHASH_MAX_WORKERS")
+    if env_cap is not None:
+        base_cap = int(env_cap)
+    elif platform.system() == "Windows":
+        # Windows uses spawn and copies image/job payloads into each worker.
+        # Local testing showed 30 workers can exhaust memory, while 8 is stable.
+        base_cap = 8
+    else:
+        base_cap = int(settings.parallel_worker_cap)
+
+    return max(1, min(int(n_pairs), int(cpu_count), int(base_cap)))
 
 
 def _photodna_process_worker_cap(
@@ -543,7 +535,7 @@ def evaluate_candidate(
             parallel_runtime=parallel_runtime,
         )
 
-    hash_fn = build_hash_fn(settings.hash_id, config)
+    hash_fn = build_hash_fn(settings.hash_id, thresholds=config.get("thresholds", {}))
     attack = build_attack_registry().get(settings.attack_id)
     rows: list[EvalRow] = []
     public_params = clean_public_params(params)
@@ -562,6 +554,7 @@ def evaluate_candidate(
                 pair_id=getattr(sample, "pair_id", str(index)),
                 resize_size=settings.resize_size,
                 resize_resample=settings.resize_resample,
+                compute_lpips=settings.compute_lpips,
             )
         )
 
@@ -605,6 +598,7 @@ def evaluate_candidate_parallel(
                 numeric_params=dict(settings.numeric_params),
                 fixed_params=dict(settings.fixed_params),
                 parallel_backend="sequential",
+                compute_lpips=settings.compute_lpips,
             ),
             params=params,
         )
@@ -642,6 +636,7 @@ def evaluate_candidate_parallel(
             max_workers=runtime.workers,
             process_start_method=runtime.process_start_method,
             show_progress=settings.parallel_show_progress,
+            compute_lpips=settings.compute_lpips,
         )
 
     errors = [row for row in row_dicts if row.get("status") != "ok"]
@@ -670,13 +665,20 @@ def summarize_rows(rows: Iterable[EvalRow], *, params: dict[str, Any], settings:
     threshold = np.array([float(row.threshold) for row in rows_list], dtype=np.float32)
     time_sec = np.array([float(row.time_sec) for row in rows_list], dtype=np.float32)
     gap = np.maximum(final - threshold, 0.0)
+    lpips_vals = np.array([float(row.lpips) for row in rows_list], dtype=np.float32)
 
     asr = float(success.mean())
     mean_l2 = float(l2.mean())
     mean_queries = float(queries.mean())
     mean_gap = float(gap.mean())
+    valid_lpips = lpips_vals[~np.isnan(lpips_vals)]
+    mean_lpips = float(np.mean(valid_lpips)) if len(valid_lpips) else float("nan")
     target_metric = float(mean_l2 + settings.alpha * mean_queries)
-    score = (target_metric / max(asr, settings.asr_floor)) + settings.failure_gap_penalty * mean_gap
+    score = (
+        (target_metric / max(asr, settings.asr_floor))
+        + settings.failure_gap_penalty * mean_gap
+        + (10_000.0 if asr == 0.0 else 0.0)
+    )
 
     return CandidateSummary(
         score=float(score),
@@ -693,6 +695,7 @@ def summarize_rows(rows: Iterable[EvalRow], *, params: dict[str, Any], settings:
         mean_final_hash_l1=float(final.mean()),
         mean_best_hash_l1=float(best.mean()),
         mean_gap_to_threshold=mean_gap,
+        mean_lpips=mean_lpips,
         params=clean_public_params(params),
         rows=[_clean_row_dict(row) for row in rows_list],
     )
@@ -717,13 +720,21 @@ def summarize_row_dicts(
     threshold = np.array([float(row["threshold"]) for row in rows_list], dtype=np.float32)
     time_sec = np.array([float(row["time_sec"]) for row in rows_list], dtype=np.float32)
     gap = np.maximum(final - threshold, 0.0)
+    lpips_raw = [float(row.get("lpips", float("nan"))) for row in rows_list]
+    lpips_vals = np.array(lpips_raw, dtype=np.float32)
 
     asr = float(success.mean())
     mean_l2 = float(l2.mean())
     mean_queries = float(queries.mean())
     mean_gap = float(gap.mean())
+    valid_lpips = lpips_vals[~np.isnan(lpips_vals)]
+    mean_lpips = float(np.mean(valid_lpips)) if len(valid_lpips) else float("nan")
     target_metric = float(mean_l2 + settings.alpha * mean_queries)
-    score = (target_metric / max(asr, settings.asr_floor)) + settings.failure_gap_penalty * mean_gap
+    score = (
+        (target_metric / max(asr, settings.asr_floor))
+        + settings.failure_gap_penalty * mean_gap
+        + (10_000.0 if asr == 0.0 else 0.0)
+    )
 
     clean_rows = []
     for row in rows_list:
@@ -746,6 +757,7 @@ def summarize_row_dicts(
         mean_final_hash_l1=float(final.mean()),
         mean_best_hash_l1=float(best.mean()),
         mean_gap_to_threshold=mean_gap,
+        mean_lpips=mean_lpips,
         params=clean_public_params(params),
         rows=clean_rows,
     )

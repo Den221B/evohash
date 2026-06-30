@@ -74,6 +74,10 @@ def aggregate_results(rows: Iterable[Any]) -> dict[str, float]:
     initial = np.array([float(r["initial_hash_l1"]) for r in dict_rows], dtype=np.float32)
     final = np.array([float(r["final_hash_l1"]) for r in dict_rows], dtype=np.float32)
     rel = np.array([float(r["relative_improvement"]) for r in dict_rows], dtype=np.float32)
+    lpips_raw = np.array(
+        [float(_row_get(r, "lpips", float("nan"))) for r in dict_rows], dtype=np.float32
+    )
+    valid_lpips = lpips_raw[~np.isnan(lpips_raw)]
 
     asr = float(success.mean())
     mean_pixel_l2 = float(pixel_l2.mean())
@@ -92,6 +96,8 @@ def aggregate_results(rows: Iterable[Any]) -> dict[str, float]:
         "median_queries": float(np.median(queries)),
         "mean_time_sec": float(time_sec.mean()),
         "score_asr_per_l2": score_asr_per_l2(asr, mean_pixel_l2),
+        "mean_lpips": float(np.mean(valid_lpips)) if len(valid_lpips) else float("nan"),
+        "median_lpips": float(np.median(valid_lpips)) if len(valid_lpips) else float("nan"),
     }
 
 
@@ -160,3 +166,72 @@ def print_comparison_table(table: dict[str, dict[str, dict[str, float]]]) -> Non
                 f"{m.get('mean_queries', 0.0):>10.1f} "
                 f"{m.get('score_asr_per_l2', 0.0):>10.3f}"
             )
+
+
+# ---------------------------------------------------------------------------
+# LPIPS — optional perceptual metric (requires torch + lpips library).
+# Lazy imports so nothing breaks when the libraries are absent.
+# Call compute_lpips() only when you explicitly need the result — it runs a
+# CNN forward pass (~10–30 ms/pair) and is NOT computed by default in the
+# evaluation pipeline.
+# ---------------------------------------------------------------------------
+
+_lpips_fn_cache = None  # loaded once per process
+
+
+def compute_lpips(x0: np.ndarray, x1: np.ndarray) -> float:
+    """Compute LPIPS between two float32 HxWxC images in [0, 1].
+
+    Returns NaN if ``torch`` or the ``lpips`` library are not installed.
+    Pass ``compute_lpips=True`` to :func:`evaluate_attack` (or
+    ``compute_lpips=True`` to :func:`run_eval_jobs`) to enable this metric
+    in the evaluation pipeline.
+    """
+    try:
+        import torch
+
+        fn = _get_lpips_fn()
+        t0 = _to_lpips_tensor(x0)
+        t1 = _to_lpips_tensor(x1)
+        with torch.no_grad():
+            return float(fn(t0, t1).item())
+    except Exception:
+        return float("nan")
+
+
+def _to_lpips_tensor(x: np.ndarray):
+    """HxWx3 float32 [0, 1] → 1xCxHxW float32 [-1, 1] (AlexNet/VGG convention)."""
+    import torch
+
+    arr = np.asarray(x, dtype=np.float32).clip(0.0, 1.0)
+    if arr.ndim == 2:
+        arr = np.stack([arr, arr, arr], axis=-1)
+    t = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0)
+    return t * 2.0 - 1.0
+
+
+def _get_lpips_fn():
+    """Return a cached LPIPS(net='alex') instance (loaded once per process)."""
+    global _lpips_fn_cache
+    if _lpips_fn_cache is None:
+        import warnings
+
+        import lpips
+
+        # lpips still calls torchvision with the deprecated pretrained=...
+        # argument.  Suppress only those noisy compatibility warnings.
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message=r"The parameter 'pretrained' is deprecated.*",
+                category=UserWarning,
+                module=r"torchvision\.models\._utils",
+            )
+            warnings.filterwarnings(
+                "ignore",
+                message=r"Arguments other than a weight enum or `None` for 'weights'.*",
+                category=UserWarning,
+                module=r"torchvision\.models\._utils",
+            )
+            _lpips_fn_cache = lpips.LPIPS(net="alex", verbose=False)
+    return _lpips_fn_cache

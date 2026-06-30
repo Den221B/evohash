@@ -1,0 +1,31 @@
+TASK: evolve a Python collision attack against PDQ.
+
+Runtime contract in this project:
+- Candidate code must define run_attack(x_source, oracle, params=None, budget=10000, seed=0).
+- x_source is one RGB image as a float32 numpy array in [0, 1].
+- The target image is not passed to the candidate. Use oracle.target_hash, oracle.threshold, and oracle.query(x).
+- oracle.query(x) returns the hash distance to the target and updates oracle.queries / oracle.best_hash_l1.
+- Return AttackRawResult(x_best=..., history=..., queries=oracle.queries, params=..., extra=...).
+- The evaluator recomputes success, final distance, L2, and query count.
+
+PDQ mechanics:
+- Convert RGB to grayscale.
+- Resize grayscale to 64x64.
+- Apply luminance normalization.
+- Apply 2D DCT.
+- Keep the top-left 16x16 low-frequency coefficients.
+- Threshold coefficients against the median of those 256 coefficients.
+- The output is a 256-bit hash.
+- Collision threshold is Hamming distance <= 92.
+
+Useful attack guidance:
+- Work near the 64x64 grayscale domain instead of raw high-resolution RGB.
+- Low-frequency grayscale perturbations matter most because the hash is DCT based.
+- The threshold is relatively generous: only reduce distance below 92, not to exact equality.
+- Median thresholding is more robust than pHash mean thresholding, so global brightness shifts are weak.
+- Visible optimized seed implementations are the allowed starting pool; mutate them toward lower queries and lower L2.
+
+Pitfalls:
+- Do not ignore the luminance normalization step.
+- Do not rely on target_image-based boundary walking; this project does not pass target images to evolved candidates.
+- Do not fake metrics; validation recomputes them.

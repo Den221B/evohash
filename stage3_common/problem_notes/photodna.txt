@@ -1,0 +1,30 @@
+TASK: evolve a Python collision attack against Microsoft PhotoDNA.
+
+Runtime contract in this project:
+- Candidate code must define run_attack(x_source, oracle, params=None, budget=10000, seed=0).
+- x_source is one RGB image as a float32 numpy array in [0, 1].
+- The target image is not passed to the candidate. Use oracle.target_hash, oracle.threshold, and oracle.query(x).
+- oracle.query(x) returns the digest distance to the target and updates oracle.queries / oracle.best_hash_l1.
+- Return AttackRawResult(x_best=..., history=..., queries=oracle.queries, params=..., extra=...).
+- The evaluator recomputes success, final distance, L2, and query count.
+- PhotoDNA evaluation is enabled only on Windows in this project pipeline.
+
+PhotoDNA mechanics:
+- Crop the largest centered square region of the image, then resize it to a small internal grid (about 26x26).
+- Work in a color space (CIE-Lab-like) rather than plain grayscale, so color information is used.
+- Partition the grid into overlapping radial/spatial sectors and compute gradient-orientation histograms (HOG-like features) per sector.
+- Concatenate and normalize those features into a 144-byte continuous digest, not a binary bit string.
+- Distance is L1 (Manhattan) over the 144 digest values; the per-image maximum is 144*255 = 36720.
+- Collision threshold is L1 distance <= 3855 (about 10.5% of the maximum).
+
+Useful attack guidance:
+- Treat this as continuous regression more than bit flipping: the digest moves smoothly with the input.
+- Work in a low-resolution color domain near the internal 26x26 scale, then upsample the perturbation to source resolution.
+- Gradient estimation is more viable here than for Hamming hashes because the L1 distance changes more smoothly and is not piecewise constant.
+- The centered square crop matters: perturbations that fall outside the visible internal crop may have little or no effect on the digest.
+- Visible optimized seed implementations are the allowed starting pool; mutate toward lower L2 and stable convergence.
+
+Pitfalls:
+- Do not treat PhotoDNA like pHash/PDQ/NeuralHash bits.
+- Do not rely on target_image-based boundary walking; this project does not pass target images to evolved candidates.
+- Do not fake metrics; validation recomputes them.

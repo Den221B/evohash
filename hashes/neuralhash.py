@@ -6,6 +6,10 @@ Expected model files by default:
 
 Environment override:
     NEURALHASH_MODEL_DIR=/path/to/model_dir
+    NEURALHASH_PROVIDER=auto|cuda|tensorrt|cpu
+    NEURALHASH_INTRA_THREADS=2
+    NEURALHASH_INTER_THREADS=1
+    NEURALHASH_PRELOAD_DLLS=0|1
 
 Digest:
     np.ndarray uint8, shape (96,), values {0, 1}
@@ -48,20 +52,52 @@ def _check_model_files(model_dir: str) -> None:
 
 def _preprocess(image: np.ndarray) -> np.ndarray:
     img = to_uint8_rgb(image)
-    pil = Image.fromarray(img).convert("RGB").resize((360, 360))
+    pil = Image.fromarray(img).resize((360, 360))
     arr = np.asarray(pil).astype(np.float32) / 255.0
     arr = arr * 2.0 - 1.0
     return arr.transpose(2, 0, 1)[np.newaxis].astype(np.float32)
 
 
 def _get_providers(ort) -> list:
+    provider = os.environ.get("NEURALHASH_PROVIDER", "auto").strip().lower()
+    if provider == "trt":
+        provider = "tensorrt"
     available = ort.get_available_providers()
+    if provider not in {"auto", "cuda", "tensorrt", "cpu"}:
+        raise ValueError("NEURALHASH_PROVIDER must be one of: auto, cuda, tensorrt, cpu")
+    if provider == "cpu":
+        return ["CPUExecutionProvider"]
+    if provider == "tensorrt":
+        if "TensorrtExecutionProvider" not in available:
+            raise RuntimeError(
+                "NEURALHASH_PROVIDER=tensorrt was requested, but "
+                "TensorrtExecutionProvider is not available. "
+                f"Available providers: {available}"
+            )
+        providers = ["TensorrtExecutionProvider"]
+        if "CUDAExecutionProvider" in available:
+            providers.append("CUDAExecutionProvider")
+        providers.append("CPUExecutionProvider")
+        return providers
     if "CUDAExecutionProvider" in available:
-        return [
-            ("CUDAExecutionProvider", {"cudnn_conv_algo_search": "DEFAULT"}),
-            "CPUExecutionProvider",
-        ]
+        return ["CUDAExecutionProvider", "CPUExecutionProvider"]
+    if provider == "cuda":
+        raise RuntimeError(
+            "NEURALHASH_PROVIDER=cuda was requested, but CUDAExecutionProvider "
+            f"is not available. Available providers: {available}"
+        )
     return ["CPUExecutionProvider"]
+
+
+def _get_session_options(ort):
+    options = ort.SessionOptions()
+    intra = os.environ.get("NEURALHASH_INTRA_THREADS")
+    inter = os.environ.get("NEURALHASH_INTER_THREADS")
+    if intra:
+        options.intra_op_num_threads = int(intra)
+    if inter:
+        options.inter_op_num_threads = int(inter)
+    return options
 
 
 class NeuralHashWrapper:
@@ -105,10 +141,20 @@ class NeuralHashWrapper:
                 "  pip install onnxruntime-gpu"
             ) from exc
 
+        if os.environ.get("NEURALHASH_PRELOAD_DLLS", "1") != "0" and hasattr(ort, "preload_dlls"):
+            try:
+                ort.preload_dlls()
+            except Exception:
+                pass
+
         model_path = os.path.join(self._model_dir, _ONNX_FILENAME)
         seed_path = os.path.join(self._model_dir, _SEED_FILENAME)
 
-        self._session = ort.InferenceSession(model_path, providers=_get_providers(ort))
+        self._session = ort.InferenceSession(
+            model_path,
+            sess_options=_get_session_options(ort),
+            providers=_get_providers(ort),
+        )
         self._input_name = self._session.get_inputs()[0].name
 
         raw = open(seed_path, "rb").read()[128:]

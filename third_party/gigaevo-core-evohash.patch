@@ -1,0 +1,383 @@
+diff --git a/config/constants/islands.yaml b/config/constants/islands.yaml
+index dd45f7c..51de887 100644
+--- a/config/constants/islands.yaml
++++ b/config/constants/islands.yaml
+@@ -10,7 +10,7 @@ island_id: fitness_island
+ # Island configuration
+ island_max_size: 75
+ migration_rate: 0.10
+-primary_resolution: 150
++primary_resolution: 20
+ validity_resolution: 2
+ binning_type: linear
+ validity_key: ${get_object:gigaevo.programs.metrics.context.VALIDITY_KEY}
+diff --git a/config/pipeline/with_context.yaml b/config/pipeline/with_context.yaml
+index d6d79cb..a03d808 100644
+--- a/config/pipeline/with_context.yaml
++++ b/config/pipeline/with_context.yaml
+@@ -11,6 +11,8 @@ evolution_context:
+ pipeline_builder:
+   _target_: gigaevo.entrypoint.default_pipelines.ContextPipelineBuilder
+   ctx: ${evolution_context}
++  stage_timeout: ${stage_timeout}
++  dag_timeout: ${dag_timeout}
+ 
+ dag_blueprint:
+   _target_: gigaevo.config.helpers.build_dag_from_builder
+diff --git a/gigaevo/entrypoint/default_pipelines.py b/gigaevo/entrypoint/default_pipelines.py
+index f682251..1bc6495 100644
+--- a/gigaevo/entrypoint/default_pipelines.py
++++ b/gigaevo/entrypoint/default_pipelines.py
+@@ -402,12 +402,19 @@ class DefaultPipelineBuilder(PipelineBuilder):
+ class ContextPipelineBuilder(DefaultPipelineBuilder):
+     """Default pipeline with AddContext stage and wiring enabled."""
+ 
+-    def __init__(self, ctx: EvolutionContext, *, dag_timeout: float = 3600.0):
+-        super().__init__(ctx, dag_timeout=dag_timeout)
++    def __init__(
++        self,
++        ctx: EvolutionContext,
++        *,
++        dag_timeout: float = 3600.0,
++        stage_timeout: float = DEFAULT_SIMPLE_STAGE_TIMEOUT,
++    ):
++        super().__init__(ctx, dag_timeout=dag_timeout, stage_timeout=stage_timeout)
+         self._add_context_stage_and_edges()
+ 
+     def _add_context_stage_and_edges(self) -> None:
+         problem_ctx = self.ctx.problem_ctx
++        stage_timeout = self._stage_timeout
+ 
+         # AddContext stage: runs build_context from context.py to produce a dict
+         self.add_stage(
+@@ -415,7 +422,7 @@ class ContextPipelineBuilder(DefaultPipelineBuilder):
+             lambda: CallFileFunction(
+                 path=problem_ctx.problem_dir / ProblemLayout.CONTEXT_FILE,
+                 function_name="build_context",
+-                timeout=DEFAULT_SIMPLE_STAGE_TIMEOUT,
++                timeout=stage_timeout,
+             ),
+         )
+ 
+diff --git a/gigaevo/llm/agents/lineage.py b/gigaevo/llm/agents/lineage.py
+index 2bd8b62..c72a6a7 100644
+--- a/gigaevo/llm/agents/lineage.py
++++ b/gigaevo/llm/agents/lineage.py
+@@ -32,7 +32,7 @@ class TransitionInsights(BaseModel):
+     """Collection of transition insights."""
+ 
+     insights: list[TransitionInsight] = Field(
+-        description="List of 3-5 strategy insights", min_length=3, max_length=5
++        description="List of 3-5 strategy insights", min_length=3, max_length=8
+     )
+ 
+ 
+diff --git a/gigaevo/llm/models.py b/gigaevo/llm/models.py
+index 96abbcc..2a4c578 100644
+--- a/gigaevo/llm/models.py
++++ b/gigaevo/llm/models.py
+@@ -13,6 +13,7 @@ from langchain_core.runnables import Runnable, RunnableConfig
+ from langchain_openai import ChatOpenAI
+ from langfuse.langchain import CallbackHandler
+ from loguru import logger
++from pydantic import BaseModel
+ 
+ from gigaevo.llm.token_tracking import TokenTracker
+ from gigaevo.utils.trackers.base import LogWriter
+@@ -300,9 +301,12 @@ class _StructuredOutputRouter(Runnable):
+         return _with_langfuse(config, self._langfuse, model_name)
+ 
+     def _process(self, response: dict, name: str) -> Any:
+-        if raw := response.get("raw"):
++        raw = response.get("raw")
++        parsed = response.get("parsed")
++        if raw is not None:
++            _sanitize_raw_parsed_for_serialization(raw, parsed)
+             self._tracker.track(raw, name)
+-        return response.get("parsed")
++        return parsed
+ 
+     def invoke(
+         self, input: LanguageModelInput, config: RunnableConfig | None = None, **kwargs
+@@ -319,3 +323,14 @@ class _StructuredOutputRouter(Runnable):
+         return self._process(
+             await model.ainvoke(input, self._config(config, name), **kwargs), name
+         )
++
++
++def _sanitize_raw_parsed_for_serialization(raw: Any, parsed: Any) -> None:
++    """Avoid Pydantic warnings when raw AIMessage stores parsed BaseModel output."""
++    if not isinstance(parsed, BaseModel):
++        return
++    additional_kwargs = getattr(raw, "additional_kwargs", None)
++    if not isinstance(additional_kwargs, dict):
++        return
++    if isinstance(additional_kwargs.get("parsed"), BaseModel):
++        additional_kwargs["parsed"] = parsed.model_dump()
+diff --git a/gigaevo/programs/metrics/formatter.py b/gigaevo/programs/metrics/formatter.py
+index 31d19da..4793995 100644
+--- a/gigaevo/programs/metrics/formatter.py
++++ b/gigaevo/programs/metrics/formatter.py
+@@ -4,17 +4,7 @@ from gigaevo.programs.metrics.context import VALIDITY_KEY, MetricsContext
+ 
+ 
+ class MetricsFormatter:
+-    """Render metrics consistently for LLM prompts.
+-
+-    Examples:
+-    - Metrics block (for keys in context.prompt_keys()):
+-      - fitness : 0.12345 (Main objective; ↑ better)
+-      - is_valid : 1 (Validity flag; ↑ better)
+-
+-    - Delta block (child - parent):
+-      - fitness (Main objective; ↑ better) +0.01234 (9.8%)
+-      - is_valid (Validity flag; ↑ better) +0.00000
+-    """
++    """Render metrics consistently for LLM prompts."""
+ 
+     def __init__(self, context: MetricsContext):
+         self.context = context
+@@ -27,7 +17,7 @@ class MetricsFormatter:
+             decimals = spec.decimals
+             desc = spec.description or ""
+             unit = spec.unit or ""
+-            orient = "↑" if self.context.is_higher_better(key) else "↓"
++            orient = "higher" if self.context.is_higher_better(key) else "lower"
+             value = metrics[key]
+             unit_str = f" {unit}" if unit else ""
+             is_sentinel_value = spec.is_sentinel(value)
+@@ -35,7 +25,8 @@ class MetricsFormatter:
+                 " [sentinel]" if is_sentinel_value and key != VALIDITY_KEY else ""
+             )
+             lines.append(
+-                f"- {key} : {value:.{decimals}f}{unit_str} ({desc}; {orient} better){sentinel}"
++                f"- {key} : {value:.{decimals}f}{unit_str} "
++                f"({desc}; {orient} is better){sentinel}"
+             )
+         return "\n".join(lines)
+ 
+@@ -67,13 +58,13 @@ class MetricsFormatter:
+             c = float(child[key])
+             d = c - p
+             pct = (100.0 * d / abs(p)) if abs(p) > 1e-12 else None
+-            orient = "↑" if higher_better else "↓"
++            orient = "higher" if higher_better else "lower"
+             impact = (
+                 "improved"
+                 if (d > 0) == higher_better
+                 else ("no change" if d == 0 else "worsened")
+             )
+-            sig = "★" if signif and abs(d) >= signif else ""
++            sig = "*" if signif and abs(d) >= signif else ""
+ 
+             parent_s = f"{p:.{decimals}f}{u(unit)}"
+             child_s = f"{c:.{decimals}f}{u(unit)}"
+@@ -85,13 +76,13 @@ class MetricsFormatter:
+                 extra_pct_sign = "<"
+             if pct is not None:
+                 pct = min(max(pct, -100.0), 100.0)
+-            pct_s = f"{extra_pct_sign}{pct:+.1f}%" if pct is not None else "—"
++            pct_s = f"{extra_pct_sign}{pct:+.1f}%" if pct is not None else "n/a"
+ 
+             rows.append(
+                 (
+                     key,
+                     desc,
+-                    f"{orient} better",
++                    f"{orient} is better",
+                     parent_s,
+                     child_s,
+                     delta_s,
+@@ -105,13 +96,13 @@ class MetricsFormatter:
+ 
+         if style == "bullets":
+             return "\n".join(
+-                f"- {k} ({dirn}) | {p} → {c} | Δ {dl}"
+-                f"{f' ({pc})' if pc != '—' else ''} | {imp}"
++                f"- {k} ({dirn}) | {p} -> {c} | delta {dl}"
++                f"{f' ({pc})' if pc != 'n/a' else ''} | {imp}"
+                 for k, _, dirn, p, c, dl, pc, imp in rows
+             )
+ 
+         header = (
+-            "| metric | direction | parent | child | Δ | %Δ | impact |\n"
++            "| metric | direction | parent | child | delta | %delta | impact |\n"
+             "|---|:--:|---:|---:|---:|---:|:--:|"
+         )
+         body = "\n".join(
+@@ -121,20 +112,15 @@ class MetricsFormatter:
+         return f"{header}\n{body}"
+ 
+     def format_metrics_description(self) -> str:
+-        """Build a concise overview of available metrics from context.
+-
+-        Example block:
+-        - fitness: Main objective (↑ better; [0.0, 1.0] range; unit="")
+-        - is_valid: Whether program is valid (↑ better; [0.0, 1.0] range; unit="")
+-        """
++        """Build a concise overview of available metrics from context."""
+         ordered_keys = self.context.prompt_keys()
+         primary_key = self.context.get_primary_key()
+         keys: list[str] = [primary_key] + [k for k in ordered_keys if k != primary_key]
+         lines: list[str] = []
+         for key in keys:
+             spec = self.context.specs[key]
+-            orient = "↑" if self.context.is_higher_better(key) else "↓"
+-            parts: list[str] = [f"{orient} better"]
++            orient = "higher" if self.context.is_higher_better(key) else "lower"
++            parts: list[str] = [f"{orient} is better"]
+             bounds = self.context.get_bounds(key)
+             if bounds is not None and bounds[0] is not None and bounds[1] is not None:
+                 parts.append(f"[{bounds[0]}, {bounds[1]}] range")
+diff --git a/gigaevo/programs/stages/python_executors/exec_runner.py b/gigaevo/programs/stages/python_executors/exec_runner.py
+index ab963aa..5ca1c40 100644
+--- a/gigaevo/programs/stages/python_executors/exec_runner.py
++++ b/gigaevo/programs/stages/python_executors/exec_runner.py
+@@ -8,6 +8,7 @@ import os
+ from pathlib import Path
+ import struct
+ import sys
++import tempfile
+ import traceback
+ import types
+ from typing import Any
+@@ -190,6 +191,8 @@ def _run_one(payload: dict[str, Any]) -> tuple[Any | None, dict[str, Any] | None
+     """
+     captured = io.StringIO()
+     old_env: dict[str, Any] | None = None
++    code_path: Path | None = None
++    old_code_path: str | object = _ENV_MISSING
+     try:
+         _ensure_cwd_in_path()
+ 
+@@ -206,6 +209,19 @@ def _run_one(payload: dict[str, Any]) -> tuple[Any | None, dict[str, Any] | None
+         if not isinstance(args, list) or not isinstance(kwargs, dict):
+             raise TypeError("Payload must contain 'args': list and 'kwargs': dict")
+ 
++        fd, raw_code_path = tempfile.mkstemp(
++            prefix=f"gigaevo_program_{os.environ.get('GIGAEVO_PROGRAM_ID_SHORT', 'unknown')}_",
++            suffix=".py",
++            text=True,
++        )
++        code_path = Path(raw_code_path)
++        with os.fdopen(fd, "w", encoding="utf-8") as fh:
++            fh.write(code)
++            if not code.endswith("\n"):
++                fh.write("\n")
++        old_code_path = os.environ.get("GIGAEVO_PROGRAM_CODE_PATH", _ENV_MISSING)
++        os.environ["GIGAEVO_PROGRAM_CODE_PATH"] = str(code_path)
++
+         _prepend_sys_path(py_path)
+         _clear_shadowed_top_level_modules(py_path)
+         mod = _load_module_from_code(code)
+@@ -246,6 +262,15 @@ def _run_one(payload: dict[str, Any]) -> tuple[Any | None, dict[str, Any] | None
+         _write_code_context(e, out=buf)
+         return (None, {"_error": True, "stderr": buf.getvalue(), "returncode": 1})
+     finally:
++        if old_code_path is _ENV_MISSING:
++            os.environ.pop("GIGAEVO_PROGRAM_CODE_PATH", None)
++        else:
++            os.environ["GIGAEVO_PROGRAM_CODE_PATH"] = str(old_code_path)
++        if code_path is not None:
++            try:
++                code_path.unlink()
++            except OSError:
++                pass
+         if old_env is not None:
+             _restore_env(old_env)
+ 
+diff --git a/gigaevo/utils/redis.py b/gigaevo/utils/redis.py
+index 974ab41..ea3dfac 100644
+--- a/gigaevo/utils/redis.py
++++ b/gigaevo/utils/redis.py
+@@ -36,8 +36,13 @@ async def fetch_evolution_dataframe(
+             redis_url=config.url(),
+             key_prefix=config.redis_prefix,
+             max_connections=50,
+-            connection_pool_timeout=30.0,
++            # A full get_all (MGET of every program) can pull hundreds of MB on a
++            # large run; 30s is far too short and made the export time out + retry
++            # for ~5 min. Raise the read timeout and cut retries so a one-shot
++            # end-of-run export can complete without hammering Redis.
++            connection_pool_timeout=300.0,
+             health_check_interval=60,
++            max_retries=2,
+             read_only=True,
+         )
+     )
+diff --git a/pyproject.toml b/pyproject.toml
+index e984337..119a6d5 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -49,9 +49,9 @@ dependencies = [
+     "click",
+     "jinja2",
+     "langgraph>=0.2.0",
+-    "langchain-core>=0.3.0",
+-    "langchain-openai>=0.2.0",
+-    "langchain>=0.3.0",
++    "langchain-core>=0.3.0,<1.0",
++    "langchain-openai>=0.2.0,<1.0",
++    "langchain>=0.3.0,<1.0",
+     "langfuse>=2.0.0",
+     "scikit-learn",
+     "optuna",
+diff --git a/config/llm/local.yaml b/config/llm/local.yaml
+new file mode 100644
+index 0000000..5ff2b73
+--- /dev/null
++++ b/config/llm/local.yaml
+@@ -0,0 +1,17 @@
++# @package _global_
++
++llm_max_retries: 2
++
++llm:
++  _target_: gigaevo.llm.models.MultiModelRouter
++  _convert_: all
++  models:
++    - _target_: langchain_openai.ChatOpenAI
++      model: ${model_name}
++      api_key: ${oc.env:OPENAI_API_KEY,local}
++      temperature: ${temperature}
++      max_tokens: ${max_tokens}
++      base_url: ${llm_base_url}
++      request_timeout: ${request_timeout}
++      max_retries: ${llm_max_retries}
++  probabilities: [1.0]
++  writer: ${writer}
+diff --git a/config/llm/openrouter.yaml b/config/llm/openrouter.yaml
+new file mode 100644
+index 0000000..9cfc28b
+--- /dev/null
++++ b/config/llm/openrouter.yaml
+@@ -0,0 +1,21 @@
++# @package _global_
++
++openrouter_base_url: https://openrouter.ai/api/v1
++llm_max_retries: 8
++
++llm:
++  _target_: gigaevo.llm.models.MultiModelRouter
++  _convert_: all
++  models:
++    - _target_: langchain_openai.ChatOpenAI
++      model: ${model_name}
++      api_key: ${oc.env:OPENROUTER_API_KEY}
++      temperature: ${temperature}
++      max_tokens: ${max_tokens}
++      base_url: ${openrouter_base_url}
++      request_timeout: ${request_timeout}
++      max_retries: ${llm_max_retries}
++      default_headers:
++        HTTP-Referer: https://localhost/evohash
++        X-Title: EvoHash Stage3 Evolution
++  probabilities: [1.0]
++  writer: ${writer}
+diff --git a/experiments/infrastructure.yaml b/experiments/infrastructure.yaml
+new file mode 100644
+index 0000000..794f5e6
+--- /dev/null
++++ b/experiments/infrastructure.yaml
+@@ -0,0 +1 @@
++no_proxy_hosts: []

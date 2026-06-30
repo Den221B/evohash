@@ -3,18 +3,52 @@ __pycache__/
 *.py[cod]
 *$py.class
 .ipynb_checkpoints/
+.venv*/
+.env
+.env.*
+!.env.example
+.claude/
 
 # Local notebooks and experiment artifacts
+*.ipynb
+defense/
+docs/
+experiments/
+figures/
 notebooks/
 outputs/
 runs_sweep/
+openevolve_checkpoint_legacy/
+stage1_find_ASR/results/
 
 # Local datasets / generated reports
+data/
 *.zip
 *.xlsx
 *.csv
+
+# LaTeX build artifacts
+thesis/
+*.aux
+*.bbl
+*.bcf
+*.blg
+*.fdb_latexmk
+*.fls
+*.log
+*.out
+*.run.xml
+*.synctex.gz
+*.toc
+*.xdv
 
 # Results are local by default; keep only the curated attack config.
 results/*
 !results/
 !results/attack_configs.json
+!results/attack_configs_optimized.json
+
+# Vendored/checked-out third-party repositories are handled separately.
+third_party/*
+!third_party/README.md
+!third_party/*.patch

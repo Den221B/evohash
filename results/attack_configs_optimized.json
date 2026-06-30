@@ -1,0 +1,176 @@
+{
+  "allowed_attacks": [
+    "nes",
+    "prokos",
+    "nes_attack_v0",
+    "simba",
+    "zo_signsgd",
+    "atkscopes"
+  ],
+  "configs": {
+    "neuralhash": {
+      "atkscopes": {
+        "a": 36.272652825354406,
+        "beta1": 0.9,
+        "beta2": 0.999,
+        "eps": 8.243022130911872e-09,
+        "lr": 5.195703445581074,
+        "max_freq": 10,
+        "max_iters": 10000,
+        "scale": "global"
+      }
+    },
+    "pdq": {
+      "atkscopes": {
+        "a": 4.498432179443098,
+        "beta1": 0.9,
+        "beta2": 0.999,
+        "eps": 1e-08,
+        "lr": 2.2240806832096887,
+        "max_freq": 17,
+        "scale": "global"
+      },
+      "nes": {
+        "lr": 0.007671410309273842,
+        "n_samples": 10,
+        "sigma": 0.3859668481678455
+      },
+      "nes_attack_v0": {
+        "grayscale_noise": true,
+        "lr": 7.577292301246718,
+        "momentum": 0.0,
+        "n_samples": 10,
+        "sigma": 0.19906824315346033
+      },
+      "prokos": {
+        "antithetic": true,
+        "grayscale_noise": true,
+        "lr": 10.656152939891479,
+        "momentum": 0.0,
+        "n_samples": 20,
+        "sigma": 0.2275035255467694
+      },
+      "simba": {
+        "epsilon": 41.24523487665658,
+        "freq_dims": 3,
+        "stride": 1
+      },
+      "zo_signsgd": {
+        "direction_dist": "gaussian",
+        "estimator": "central",
+        "eval_updated_point": true,
+        "lr": 0.05590513830646902,
+        "mu": 0.21120257049469043,
+        "q": 30
+      }
+    },
+    "phash": {
+      "atkscopes": {
+        "a": 22.70446859111565,
+        "beta1": 0.9,
+        "beta2": 0.999,
+        "eps": 1e-08,
+        "lr": 3.0071889520628323,
+        "max_freq": 8,
+        "scale": "global"
+      },
+      "nes": {
+        "lr": 0.3257197657233062,
+        "n_samples": 10,
+        "sigma": 2.5479014057812157
+      },
+      "nes_attack_v0": {
+        "grayscale_noise": true,
+        "lr": 77.51993091505682,
+        "momentum": 0.0,
+        "n_samples": 20,
+        "sigma": 2.1630172987247906
+      },
+      "prokos": {
+        "antithetic": true,
+        "grayscale_noise": true,
+        "lr": 48.731737390497344,
+        "momentum": 0.0,
+        "n_samples": 10,
+        "sigma": 0.9455708503809829
+      },
+      "simba": {
+        "epsilon": 139.7853932663068,
+        "freq_dims": 2,
+        "stride": 1
+      },
+      "zo_signsgd": {
+        "direction_dist": "gaussian",
+        "estimator": "central",
+        "eval_updated_point": true,
+        "lr": 0.15070182881418728,
+        "mu": 0.631909406075787,
+        "q": 10
+      }
+    },
+    "photodna": {
+      "atkscopes": {
+        "a": 4.443566509056172,
+        "beta1": 0.9,
+        "beta2": 0.999,
+        "lr": 3.855169125841428,
+        "max_freq": 5,
+        "patch_size": 128,
+        "scale": "mid"
+      },
+      "nes": {
+        "lr": 0.001724145121254941,
+        "n_samples": 30,
+        "sigma": 0.562859408394855
+      },
+      "nes_attack_v0": {
+        "grayscale_noise": true,
+        "lr": 74.38735591120431,
+        "momentum": 0.0,
+        "n_samples": 20,
+        "sigma": 0.4235023636220878
+      },
+      "prokos": {
+        "antithetic": true,
+        "grayscale_noise": true,
+        "lr": 26.751270189680085,
+        "momentum": 0.0,
+        "n_samples": 10,
+        "sigma": 0.2220294630633497
+      },
+      "simba": {
+        "epsilon": 16.30308909697262,
+        "freq_dims": 9,
+        "stride": 1
+      },
+      "zo_signsgd": {
+        "direction_dist": "gaussian",
+        "estimator": "central",
+        "eval_updated_point": true,
+        "lr": 0.04264469033486609,
+        "mu": 0.05493980037398245,
+        "q": 10
+      }
+    }
+  },
+  "defaults": {
+    "budget": 10000,
+    "seed": 0
+  },
+  "hashes": [
+    "pdq",
+    "phash",
+    "neuralhash",
+    "photodna"
+  ],
+  "preprocess": {
+    "resize_resample": "bilinear",
+    "resize_size": 256
+  },
+  "thresholds": {
+    "pdq": 92.0,
+    "phash": 12.0,
+    "photodna": 3855.0,
+    "neuralhash": 17.0
+  }
+}

@@ -9,6 +9,7 @@ import numpy as np
 
 from evohash.attacks.base import AttackRawResult, RegisteredAttack
 from evohash.metrics import (
+    compute_lpips as _compute_lpips,
     compute_pixel_l2,
     compute_pixel_l2_raw,
     compute_relative_improvement,
@@ -35,6 +36,7 @@ class EvalRow:
 
     pixel_l2: float
     pixel_l2_raw: float
+    lpips: float
     queries: int
     budget: int | None
     time_sec: float
@@ -87,6 +89,7 @@ def evaluate_attack(
     constraints: ConstraintSpec | None = None,
     resize_size: int | None = None,
     resize_resample: str = "bilinear",
+    compute_lpips: bool = False,
 ) -> EvalRow:
     """Run one attack on one pair and recompute all final metrics."""
     x0_original = to_float32(x_source)
@@ -145,6 +148,9 @@ def evaluate_attack(
 
     pixel_l2 = compute_pixel_l2(x0, x_best)
     pixel_l2_raw = compute_pixel_l2_raw(x0, x_best)
+
+    lpips_score = float(_compute_lpips(x0, x_best)) if compute_lpips else float("nan")
+
     success = bool(final_hash_l1 <= threshold)
     improved = bool(final_hash_l1 < initial_hash_l1)
     relative_improvement = compute_relative_improvement(
@@ -169,6 +175,7 @@ def evaluate_attack(
         relative_improvement=float(relative_improvement),
         pixel_l2=float(pixel_l2),
         pixel_l2_raw=float(pixel_l2_raw),
+        lpips=lpips_score,
         queries=int(oracle.queries),
         budget=budget_spec.max_queries,
         time_sec=time_sec,

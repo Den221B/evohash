@@ -1,0 +1,29 @@
+TASK: evolve a Python collision attack against pHash.
+
+Runtime contract in this project:
+- Candidate code must define run_attack(x_source, oracle, params=None, budget=10000, seed=0).
+- x_source is one RGB image as a float32 numpy array in [0, 1].
+- The target image is not passed to the candidate. Use oracle.target_hash, oracle.threshold, and oracle.query(x).
+- oracle.query(x) returns the hash distance to the target and updates oracle.queries / oracle.best_hash_l1.
+- Return AttackRawResult(x_best=..., history=..., queries=oracle.queries, params=..., extra=...).
+- The evaluator recomputes success, final distance, L2, and query count.
+
+pHash mechanics:
+- Convert RGB to grayscale.
+- Resize grayscale to 32x32.
+- Apply 2D DCT.
+- Keep the top-left 8x8 low-frequency coefficients.
+- Threshold each coefficient against the mean of those 64 coefficients.
+- The output is a 64-bit hash.
+- Collision threshold is Hamming distance <= 12.
+
+Useful attack guidance:
+- Work in the 32x32 grayscale domain, then upsample perturbations to the source resolution.
+- RGB-only channel tricks are usually wasted unless they survive grayscale conversion.
+- Small pixel-space finite differences often produce zero signal because Hamming distance is integer and piecewise constant.
+- Low-frequency grayscale perturbations are much more likely to affect the hash than high-resolution noise.
+- For black-box mutation, start from the visible optimized seed implementation and adjust strategy around query efficiency and distortion.
+
+Pitfalls:
+- Do not rely on target_image-based boundary walking; this project does not pass target images to evolved candidates.
+- Do not report self-computed success as authoritative; validation ignores it.

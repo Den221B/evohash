@@ -1,0 +1,33 @@
+services:
+  redis:
+    image: redis:7-alpine
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --save
+      - ""
+      - --timeout
+      - "0"
+      - --tcp-keepalive
+      - "60"
+      - --maxclients
+      - "10000"
+      - --client-output-buffer-limit
+      - normal
+      - "0"
+      - "0"
+      - "0"
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  redis_data:

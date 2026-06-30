@@ -1,0 +1,30 @@
+TASK: evolve a Python collision attack against Apple NeuralHash.
+
+Runtime contract in this project:
+- Candidate code must define run_attack(x_source, oracle, params=None, budget=10000, seed=0).
+- x_source is one RGB image as a float32 numpy array in [0, 1].
+- The target image is not passed to the candidate. Use oracle.target_hash, oracle.threshold, and oracle.query(x).
+- oracle.query(x) returns the hash distance to the target and updates oracle.queries / oracle.best_hash_l1.
+- Return AttackRawResult(x_best=..., history=..., queries=oracle.queries, params=..., extra=...).
+- The evaluator recomputes success, final distance, L2, and query count.
+
+NeuralHash mechanics:
+- Resize the RGB image to 360x360 and normalize to roughly [-1, 1].
+- Run a convolutional neural network to obtain a 128-dimensional continuous embedding.
+- Project that embedding through a fixed 96x128 seed matrix.
+- Binarize the projection by sign to obtain a 96-bit hash.
+- Distance is Hamming over the 96 bits; collision threshold is <= 17 (about 18% of the bits).
+- Color is preserved through the pipeline, so chrominance changes can affect the hash.
+- Bits are entangled: a small change in the embedding can flip several output bits at once because each bit is a sign of a dense linear combination.
+
+Useful attack guidance:
+- Unlike pHash/PDQ, there is no simple DCT bit map; the hash is a learned, smooth function of the full-color image.
+- Because the embedding is continuous, the hash distance responds more gradually than on DCT hashes, so gradient-free estimation over the embedding direction can carry signal.
+- Each query runs neural inference and is relatively expensive, so query discipline matters more here than on cheap DCT hashes.
+- Low-dimensional perturbation parameterizations can help keep distortion down: patches, smooth fields, color shifts, low-rank patterns, or frequency-limited noise.
+- Visible optimized seed implementations are the allowed starting pool; mutate around robustness, query efficiency, and lower distortion.
+
+Pitfalls:
+- Do not use pHash/PDQ-specific DCT coefficient logic as if it were causal.
+- Do not rely on target_image-based boundary walking; this project does not pass target images to evolved candidates.
+- Do not fake metrics; validation recomputes them.
