@@ -11,6 +11,12 @@ __pycache__/
 
 # Local notebooks and experiment artifacts
 *.ipynb
+# ...except the curated example notebook of each stage (keep them output-free).
+!stage2_optimize/optimize.ipynb
+!stage2_optimize/NeuralHash_optimize.ipynb
+!stage3_openevolve/OpenEvolve.ipynb
+!stage3_gigaevolve/GigaEvolve.ipynb
+!stage4_benchmark/Benchmark.ipynb
 defense/
 docs/
 experiments/
@@ -22,8 +28,10 @@ openevolve_checkpoint_legacy/
 stage1_find_ASR/results/
 
 # Local datasets / generated reports
-data/
+data/*
 *.zip
+!data/dataset_v1_public.zip
+!data/dataset_v1_full.zip
 *.xlsx
 *.csv
 

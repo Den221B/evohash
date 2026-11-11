@@ -10,10 +10,14 @@ Clone upstream at the version used during EvoHash experiments:
 
 ```powershell
 git clone https://github.com/FusionBrainLab/gigaevo-core third_party/gigaevolve_core
-git -C third_party/gigaevolve_core checkout 8d1354d
+git -C third_party/gigaevolve_core checkout 7a3ab40
 git -C third_party/gigaevolve_core apply ../gigaevo-core-evohash.patch
 python -m pip install -e third_party/gigaevolve_core
 ```
+
+`7a3ab40` is upstream release 1.28.0. Upstream rewrote its history on
+2026-08-17, so the hash used during the experiments (`8d1354d`) no longer
+exists; `7a3ab40` has the same code (only docs/examples were sanitized).
 
 The patch adds the local/OpenRouter LLM configs and a few runtime fixes needed
 by the stage3 EvoHash evolution pipeline. It is a temporary lightweight

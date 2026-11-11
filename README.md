@@ -5,9 +5,10 @@ against perceptual image hashing systems. It includes wrappers for several hash
 functions, baseline attacks, hyperparameter search, LLM-guided evolution, and
 benchmark tooling.
 
-The repository intentionally keeps generated artifacts, notebooks, datasets,
-thesis files, and local experiment outputs out of git. Curated attack
-configuration files are tracked under `results/`.
+The repository intentionally keeps generated artifacts, research scratch
+notebooks, thesis files, and local experiment outputs out of git. Tracked are
+the datasets (`data/`), curated attack configuration files (`results/`), and
+one example notebook per stage (see [Notebooks](#notebooks)).
 
 ## What Is Included
 
@@ -29,8 +30,8 @@ configuration files are tracked under `results/`.
 
 The following are intentionally ignored:
 
-- datasets under `data/`
-- notebooks (`*.ipynb`) unless manually force-added
+- other datasets and archives (`*.zip`, `data/` except the two tracked archives)
+- notebooks (`*.ipynb`) except the curated stage notebooks listed below
 - experiment outputs under `outputs/`
 - generated results under `results/*`, except curated config JSON files
 - thesis/defense/figure legacy workspaces
@@ -44,45 +45,71 @@ git add -f path\to\notebook.ipynb
 
 ## Setup
 
-Create a Python environment, install the project dependencies, and prepare the
-local GigaEvolve checkout described in `third_party/README.md`.
+Tested with Python 3.12 on Windows (PhotoDNA needs Windows: it ships as a DLL).
 
-Typical local setup:
+The code is imported as the package `evohash`, so the checkout folder must be
+named `evohash` (the default for `git clone`). The GigaEvolve checkout must
+exist before installing requirements, because `requirements.txt` installs it in
+editable mode.
 
 ```powershell
+git clone https://github.com/Den221B/evohash.git
+cd evohash
+
+# GigaEvolve core + EvoHash patch (details: third_party/README.md)
+git clone https://github.com/FusionBrainLab/gigaevo-core third_party/gigaevolve_core
+git -C third_party/gigaevolve_core checkout 7a3ab40
+git -C third_party/gigaevolve_core apply ../gigaevo-core-evohash.patch
+
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
 
-For GigaEvolve-based stage3 runs:
+`requirements.txt` pins the CPU build of torch from PyPI. That is enough for
+everything here (torch is only used for LPIPS; NeuralHash runs on onnxruntime).
 
-```powershell
-Get-Content third_party\README.md
-```
-
-If you use GigaEvolve with Redis:
+GigaEvolve stores its population in Redis:
 
 ```powershell
 docker compose up -d redis
 ```
 
-Datasets are local. Put the public dataset archive under `data/`, for example:
+LLM keys go into `.env` in the repo root (see `.env.example`).
 
-```text
-data/dataset_v1_public.zip
-```
+### Datasets
 
-When running modules from this package directory, make sure Python can import
-`evohash`; from PowerShell this usually means setting `PYTHONPATH` to the parent
-directory:
+Both dataset archives are tracked under `data/`:
+
+- `data/dataset_v1_public.zip` - public split, 30 pairs (tuning, evolution).
+- `data/dataset_v1_full.zip` - public + secret split, 100 secret pairs (final benchmark).
+
+When running modules from the command line, make sure Python can import
+`evohash` by putting the parent directory on `PYTHONPATH`:
 
 ```powershell
 $env:PYTHONPATH = (Get-Location).Parent.FullName
 ```
 
+## Notebooks
+
+One notebook per stage; each has a config cell at the top (`HASH_ID`, budget,
+pairs, LLM). Open them from their own folder.
+
+- `stage2_optimize/optimize.ipynb` - Optuna tuning of baseline attack configs
+  (`pdq`, `phash`, `photodna`).
+- `stage2_optimize/NeuralHash_optimize.ipynb` - the same for NeuralHash
+  (separate search space and process settings).
+- `stage3_openevolve/OpenEvolve.ipynb` - LLM-guided evolution with OpenEvolve.
+- `stage3_gigaevolve/GigaEvolve.ipynb` - LLM-guided evolution with GigaEvolve
+  (needs Redis).
+- `stage4_benchmark/Benchmark.ipynb` - final benchmark: original vs optimized
+  configs vs evolved programs (`split="public"` or `"secret"`).
+
 ## Quick Checks
+
+Run from the repository folder with `PYTHONPATH` set as above.
 
 Compile the tracked Python modules:
 
@@ -96,10 +123,10 @@ Run a dry GigaEvolve package generation:
 python -m evohash.stage3_gigaevolve.run --hash phash --dataset data/dataset_v1_public.zip --dry-run
 ```
 
-Run an OpenEvolve package generation:
+Run a dry OpenEvolve package generation:
 
 ```powershell
-python -m evohash.stage3_openevolve.run --hash phash --dataset data/dataset_v1_public.zip --dry-run
+python -m evohash.stage3_openevolve.run --hash phash --dataset data/dataset_v1_public.zip --llm-source none --dry-run
 ```
 
 ## Metrics
